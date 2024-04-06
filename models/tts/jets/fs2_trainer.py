@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from models.tts.base import TTSTrainer
-from models.tts.fastspeech2.fs2 import FastSpeech2, FastSpeech2Loss
-from models.tts.fastspeech2.fs2_dataset import FS2Dataset, FS2Collator
+from models.tts.jets.fs2 import FastSpeech2
+from models.tts.jets.jets_loss import FastSpeech2Loss
+from models.tts.jets.fs2_dataset import FS2Dataset, FS2Collator
 from optimizer.optimizers import NoamLR
 
 
@@ -34,7 +35,7 @@ class FastSpeech2Trainer(TTSTrainer):
             self.sw.add_scalar("val/" + key, value, self.step)
 
     def _build_criterion(self):
-        return FastSpeech2Loss(self.cfg)
+        return FastSpeech2Loss()
 
     def get_state_dict(self):
         state_dict = {

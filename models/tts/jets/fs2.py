@@ -12,10 +12,13 @@ import torch.nn.functional as F
 from modules.transformer.Models import Encoder, Decoder
 from modules.transformer.Layers import PostNet
 from collections import OrderedDict
-
+from models.tts.jets.alignments import AlignmentModule, viterbi_decode, average_by_duration, make_pad_mask, make_non_pad_mask, get_random_segments
+from models.tts.jets.length_regulator import GaussianUpsampling
+from models.vocoders.gan.generator.hifigan import HiFiGAN
 import os
 import json
 
+from utils.util import load_config
 
 def get_mask_from_lengths(lengths, max_len=None):
     device = lengths.device
@@ -396,11 +399,73 @@ class FastSpeech2(nn.Module):
                 cfg.model.transformer.encoder_hidden,
             )
 
+        output_dim = cfg.model.variance_predictor.filter_size
+        attention_dim = 256
+        self.alignment_module = AlignmentModule(attention_dim, output_dim)
+
+        # NOTE(kan-bayashi): We use continuous pitch + FastPitch style avg
+        pitch_embed_kernel_size: int = 9
+        pitch_embed_dropout: float = 0.5
+        self.pitch_embed = torch.nn.Sequential(
+            torch.nn.Conv1d(
+                in_channels=1,
+                out_channels=attention_dim,
+                kernel_size=pitch_embed_kernel_size,
+                padding=(pitch_embed_kernel_size - 1) // 2,
+            ),
+            torch.nn.Dropout(pitch_embed_dropout),
+        )
+        
+        # NOTE(kan-bayashi): We use continuous enegy + FastPitch style avg
+        energy_embed_kernel_size: int = 9
+        energy_embed_dropout: float = 0.5
+        self.energy_embed = torch.nn.Sequential(
+            torch.nn.Conv1d(
+                in_channels=1,
+                out_channels=attention_dim,
+                kernel_size=energy_embed_kernel_size,
+                padding=(energy_embed_kernel_size - 1) // 2,
+            ),
+            torch.nn.Dropout(energy_embed_dropout),
+        )
+
+        # define length regulator
+        self.length_regulator = GaussianUpsampling()
+
+        self.segment_size: int = 64
+
+        # Define HiFiGAN generator
+        hifi_cfg = load_config("egs/vocoder/gan/hifigan/exp_config.json")
+        self.generator = HiFiGAN(hifi_cfg)
+
+    def _source_mask(self, ilens: torch.Tensor) -> torch.Tensor:
+        """Make masks for self-attention.
+
+        Args:
+            ilens (LongTensor): Batch of lengths (B,).
+
+        Returns:
+            Tensor: Mask tensor for self-attention.
+                dtype=torch.uint8 in PyTorch 1.2-
+                dtype=torch.bool in PyTorch 1.2+ (including 1.2)
+
+        Examples:
+            >>> ilens = [5, 3]
+            >>> self._source_mask(ilens)
+            tensor([[[1, 1, 1, 1, 1],
+                     [1, 1, 1, 0, 0]]], dtype=torch.uint8)
+
+        """
+        x_masks = make_non_pad_mask(ilens).to(next(self.parameters()).device)
+        return x_masks.unsqueeze(-2)
+    
     def forward(self, data, p_control=1.0, e_control=1.0, d_control=1.0):
         speakers = data["spk_id"]
         texts = data["texts"]
         src_lens = data["text_len"]
         max_src_len = max(src_lens)
+        feats = data["mel"]
+        feats_lengths = len(feats)
         mel_lens = data["target_len"] if "target_len" in data else None
         max_mel_len = max(mel_lens) if "target_len" in data else None
         p_targets = data["pitch"] if "pitch" in data else None
@@ -419,6 +484,17 @@ class FastSpeech2(nn.Module):
             output = output + self.speaker_emb(speakers).unsqueeze(1).expand(
                 -1, max_src_len, -1
             )
+
+        # forward alignment module and obtain duration, averaged pitch, energy
+        # h_masks = make_pad_mask(text_lengths).to(hs.device)
+        h_masks = make_pad_mask(src_lens).to(output.device)
+        # log_p_attn = self.alignment_module(hs, feats, h_masks)
+        log_p_attn = self.alignment_module(output, feats, h_masks)
+        ds, bin_loss = viterbi_decode(log_p_attn, src_lens, feats_lengths)
+        # ps = average_by_duration(ds, pitch.squeeze(-1), text_lengths, feats_lengths).unsqueeze(-1)
+        ps = average_by_duration(ds, p_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
+        # es = average_by_duration(ds, energy.squeeze(-1), text_lengths, feats_lengths).unsqueeze(-1)
+        es = average_by_duration(ds, e_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
 
         (
             output,
@@ -441,108 +517,30 @@ class FastSpeech2(nn.Module):
             d_control,
         )
 
-        output, mel_masks = self.decoder(output, mel_masks)
-        output = self.mel_linear(output)
 
-        postnet_output = self.postnet(output) + output
+        # use groundtruth in training
+        p_embs = self.pitch_embed(ps.transpose(1, 2)).transpose(1, 2)
+        e_embs = self.energy_embed(es.transpose(1, 2)).transpose(1, 2)
+        output = output + e_embs + p_embs
 
-        return {
-            "output": output,
-            "postnet_output": postnet_output,
-            "p_predictions": p_predictions,
-            "e_predictions": e_predictions,
-            "log_d_predictions": log_d_predictions,
-            "d_rounded": d_rounded,
-            "src_masks": src_masks,
-            "mel_masks": mel_masks,
-            "src_lens": src_lens,
-            "mel_lens": mel_lens,
-        }
+        # upsampling
+        h_masks = make_non_pad_mask(feats_lengths).to(output.device) 
+        d_masks = make_non_pad_mask(src_lens).to(ds.device)
+        output = self.length_regulator(output, ds, h_masks, d_masks)  # (B, T_feats, adim)
 
+        # forward decoder
+        h_masks = self._source_mask(feats_lengths)
+        zs, _ = self.decoder(output, h_masks)  # (B, T_feats, adim)
 
-class FastSpeech2Loss(nn.Module):
-    """FastSpeech2 Loss"""
-
-    def __init__(self, cfg):
-        super(FastSpeech2Loss, self).__init__()
-        if cfg.preprocess.use_frame_pitch:
-            self.pitch_feature_level = "frame_level"
-        else:
-            self.pitch_feature_level = "phoneme_level"
-
-        if cfg.preprocess.use_frame_energy:
-            self.energy_feature_level = "frame_level"
-        else:
-            self.energy_feature_level = "phoneme_level"
-
-        self.mse_loss = nn.MSELoss()
-        self.mae_loss = nn.L1Loss()
-
-    def forward(self, data, predictions):
-        mel_targets = data["mel"]
-        pitch_targets = data["pitch"].float()
-        energy_targets = data["energy"].float()
-        duration_targets = data["durations"]
-
-        mel_predictions = predictions["output"]
-        postnet_mel_predictions = predictions["postnet_output"]
-        pitch_predictions = predictions["p_predictions"]
-        energy_predictions = predictions["e_predictions"]
-        log_duration_predictions = predictions["log_d_predictions"]
-        src_masks = predictions["src_masks"]
-        mel_masks = predictions["mel_masks"]
-
-        src_masks = ~src_masks
-        mel_masks = ~mel_masks
-
-        log_duration_targets = torch.log(duration_targets.float() + 1)
-        mel_targets = mel_targets[:, : mel_masks.shape[1], :]
-        mel_masks = mel_masks[:, : mel_masks.shape[1]]
-
-        log_duration_targets.requires_grad = False
-        pitch_targets.requires_grad = False
-        energy_targets.requires_grad = False
-        mel_targets.requires_grad = False
-
-        if self.pitch_feature_level == "phoneme_level":
-            pitch_predictions = pitch_predictions.masked_select(src_masks)
-            pitch_targets = pitch_targets.masked_select(src_masks)
-        elif self.pitch_feature_level == "frame_level":
-            pitch_predictions = pitch_predictions.masked_select(mel_masks)
-            pitch_targets = pitch_targets.masked_select(mel_masks)
-
-        if self.energy_feature_level == "phoneme_level":
-            energy_predictions = energy_predictions.masked_select(src_masks)
-            energy_targets = energy_targets.masked_select(src_masks)
-        if self.energy_feature_level == "frame_level":
-            energy_predictions = energy_predictions.masked_select(mel_masks)
-            energy_targets = energy_targets.masked_select(mel_masks)
-
-        log_duration_predictions = log_duration_predictions.masked_select(src_masks)
-        log_duration_targets = log_duration_targets.masked_select(src_masks)
-
-        mel_predictions = mel_predictions.masked_select(mel_masks.unsqueeze(-1))
-        postnet_mel_predictions = postnet_mel_predictions.masked_select(
-            mel_masks.unsqueeze(-1)
-        )
-        mel_targets = mel_targets.masked_select(mel_masks.unsqueeze(-1))
-
-        mel_loss = self.mae_loss(mel_predictions, mel_targets)
-        postnet_mel_loss = self.mae_loss(postnet_mel_predictions, mel_targets)
-
-        pitch_loss = self.mse_loss(pitch_predictions, pitch_targets)
-        energy_loss = self.mse_loss(energy_predictions, energy_targets)
-        duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
-
-        total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss
+        # get random segments
+        z_segments, z_start_idxs = get_random_segments(
+            zs.transpose(1,2),
+            feats_lengths,
+            self.segment_size,
         )
 
-        return {
-            "loss": total_loss,
-            "mel_loss": mel_loss,
-            "postnet_mel_loss": postnet_mel_loss,
-            "pitch_loss": pitch_loss,
-            "energy_loss": energy_loss,
-            "duration_loss": duration_loss,
-        }
+        # forward generator
+        wav = self.generator(z_segments)
+
+        return wav, bin_loss, log_p_attn, z_start_idxs, log_d_predictions, ds, p_predictions, ps, e_predictions, es, feats_lengths, len(texts)
+
