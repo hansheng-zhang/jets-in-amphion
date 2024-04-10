@@ -4,12 +4,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from typeguard import check_argument_types
+# from typeguard import check_argument_types
 
 import humanfriendly
 import librosa
 from torch_complex.tensor import ComplexTensor
 from packaging.version import parse as V
+
+from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
 
 def get_random_segments(
     x: torch.Tensor,
@@ -166,7 +168,7 @@ class VarianceLoss(torch.nn.Module):
                 calculation.
 
         """
-        assert check_argument_types()
+        # assert check_argument_types()
         super().__init__()
 
         assert (use_masking != use_weighted_masking) or not use_masking
@@ -613,6 +615,8 @@ class FastSpeech2Loss(nn.Module):
         lambda_var: float = 1.0,
         lambda_align: float = 2.0,
         ):
+        super(FastSpeech2Loss, self).__init__()
+        self.discriminator = MultiScaleMultiPeriodDiscriminator()
         self.generator_adv_loss = GeneratorAdversarialLoss(
             **generator_adv_loss_params,
         )
@@ -704,7 +708,7 @@ class Stft(torch.nn.Module):
         normalized: bool = False,
         onesided: bool = True,
     ):
-        assert check_argument_types()
+        # assert check_argument_types()
         super().__init__()
         self.n_fft = n_fft
         if win_length is None:
@@ -913,7 +917,7 @@ class LogMelFbank(torch.nn.Module):
         htk: bool = False,
         log_base: Optional[float] = 10.0,
     ):
-        assert check_argument_types()
+        # assert check_argument_types()
         super().__init__()
         if isinstance(fs, str):
             fs = humanfriendly.parse_size(fs)

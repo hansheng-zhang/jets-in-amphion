@@ -9,10 +9,10 @@ from tqdm import tqdm
 from collections import OrderedDict
 
 from models.tts.base.tts_inferece import TTSInference
-from models.tts.jets.fs2_dataset import FS2TestDataset, FS2TestCollator
+from models.tts.fastspeech2.fs2_dataset import FS2TestDataset, FS2TestCollator
 from utils.util import load_config
 from utils.io import save_audio
-from models.tts.jets.fs2 import FastSpeech2
+from models.tts.fastspeech2.fs2 import FastSpeech2
 from models.vocoders.vocoder_inference import synthesis
 from pathlib import Path
 from processors.phone_extractor import phoneExtractor

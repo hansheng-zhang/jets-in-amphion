@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from modules.transformer.Models import Encoder, Decoder
 from modules.transformer.Layers import PostNet
 from collections import OrderedDict
-from models.tts.jets.alignments import AlignmentModule, viterbi_decode, average_by_duration, make_pad_mask, make_non_pad_mask, get_random_segments
-from models.tts.jets.length_regulator import GaussianUpsampling
+from models.tts.fastspeech2.alignments import AlignmentModule, viterbi_decode, average_by_duration, make_pad_mask, make_non_pad_mask, get_random_segments
+from models.tts.fastspeech2.length_regulator import GaussianUpsampling
 from models.vocoders.gan.generator.hifigan import HiFiGAN
 import os
 import json
@@ -399,7 +399,7 @@ class FastSpeech2(nn.Module):
                 cfg.model.transformer.encoder_hidden,
             )
 
-        output_dim = cfg.model.variance_predictor.filter_size
+        output_dim = cfg.preprocess.n_mel
         attention_dim = 256
         self.alignment_module = AlignmentModule(attention_dim, output_dim)
 
@@ -436,6 +436,8 @@ class FastSpeech2(nn.Module):
 
         # Define HiFiGAN generator
         hifi_cfg = load_config("egs/vocoder/gan/hifigan/exp_config.json")
+        hifi_cfg.model.hifigan.resblock_kernel_sizes = [3, 7, 11]
+        hifi_cfg.preprocess.n_mel = cfg.preprocess.n_mel
         self.generator = HiFiGAN(hifi_cfg)
 
     def _source_mask(self, ilens: torch.Tensor) -> torch.Tensor:
@@ -465,8 +467,8 @@ class FastSpeech2(nn.Module):
         src_lens = data["text_len"]
         max_src_len = max(src_lens)
         feats = data["mel"]
-        feats_lengths = len(feats)
         mel_lens = data["target_len"] if "target_len" in data else None
+        feats_lengths = mel_lens
         max_mel_len = max(mel_lens) if "target_len" in data else None
         p_targets = data["pitch"] if "pitch" in data else None
         e_targets = data["energy"] if "energy" in data else None
@@ -518,19 +520,10 @@ class FastSpeech2(nn.Module):
         )
 
 
-        # use groundtruth in training
-        p_embs = self.pitch_embed(ps.transpose(1, 2)).transpose(1, 2)
-        e_embs = self.energy_embed(es.transpose(1, 2)).transpose(1, 2)
-        output = output + e_embs + p_embs
-
-        # upsampling
-        h_masks = make_non_pad_mask(feats_lengths).to(output.device) 
-        d_masks = make_non_pad_mask(src_lens).to(ds.device)
-        output = self.length_regulator(output, ds, h_masks, d_masks)  # (B, T_feats, adim)
 
         # forward decoder
-        h_masks = self._source_mask(feats_lengths)
-        zs, _ = self.decoder(output, h_masks)  # (B, T_feats, adim)
+        # h_masks = self._source_mask(feats_lengths)
+        zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
 
         # get random segments
         z_segments, z_start_idxs = get_random_segments(
