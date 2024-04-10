@@ -10,6 +10,7 @@ from torch.nn import Conv2d, Conv1d
 from torch.nn.utils import weight_norm, spectral_norm
 from torch import nn
 from modules.vocoder_blocks import *
+from models.vocoders.gan.discriminator.msd import MultiScaleDiscriminator_JETS
 
 LRELU_SLOPE = 0.1
 
@@ -121,7 +122,8 @@ class MultiPeriodDiscriminator(torch.nn.Module):
             y_d_gs.append(y_d_g)
             fmap_gs.append(fmap_g)
 
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs 
+        # fmap_rs is groudtruth, fmap_gs is generated
 
 
 # TODO: merge with DiscriminatorP (lmxue, yicheng)
@@ -267,3 +269,43 @@ class MultiPeriodDiscriminator_vits(torch.nn.Module):
         }
 
         return outputs
+    
+class MultiPeriodDiscriminator_JETS(torch.nn.Module):
+    def __init__(self, use_spectral_norm=False):
+        super(MultiPeriodDiscriminator_JETS, self).__init__()
+        periods = [2, 3, 5, 7, 11]
+
+        discs = [
+            DiscriminatorP_vits(i, use_spectral_norm=use_spectral_norm) for i in periods
+        ]
+        self.discriminators = nn.ModuleList(discs)
+
+    def forward(self, y):
+        y_d_rs = []
+        fmap_rs = []
+        for i, d in enumerate(self.discriminators):
+            y_d_r, fmap_r = d(y)
+            y_d_rs.append(y_d_r)
+            fmap_rs.append(fmap_r)
+
+        return y_d_rs, fmap_rs
+
+# JETS Multi-scale Multi-period discriminator module. 
+class MultiScaleMultiPeriodDiscriminator(torch.nn.Module):
+    """HiFi-GAN multi-scale + multi-period discriminator module."""
+    
+    def __init__(self, use_spectral_norm=False):
+        super(MultiScaleMultiPeriodDiscriminator, self).__init__()
+
+        self.msd = MultiPeriodDiscriminator_JETS()
+        self.mpd = MultiScaleDiscriminator_JETS()
+
+    def forward(self, y):
+
+        _, msd_fmap_rs = self.msd(y)
+        # msd_outs = self.msd(y, y_hat)
+        _, mpd_fmap_rs= self.mpd(y)
+        # mpd_outs = self.mpd(y, y_hat)
+        return msd_fmap_rs + mpd_fmap_rs
+        # ground_truth, generated
+        # return msd_outs + mpd_outs

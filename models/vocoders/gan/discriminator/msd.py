@@ -36,7 +36,7 @@ class DiscriminatorS(nn.Module):
         self.conv_post = norm_f(Conv1d(1024, 1, 3, 1, padding=1))
 
     def forward(self, x):
-        fmap = []
+        fmap = []   # out we need
 
         for l in self.convs:
             x = l(x)
@@ -47,7 +47,7 @@ class DiscriminatorS(nn.Module):
         fmap.append(x)
         x = torch.flatten(x, 1, -1)
 
-        return x, fmap
+        return x, fmap  # fmap = outs in hifigan
 
 
 class MultiScaleDiscriminator(nn.Module):
@@ -69,8 +69,8 @@ class MultiScaleDiscriminator(nn.Module):
         )
 
     def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
+        y_d_rs = []     # p, y, groud-truth
+        y_d_gs = []     # p_hat, y_hat, generated
         fmap_rs = []
         fmap_gs = []
 
@@ -86,3 +86,35 @@ class MultiScaleDiscriminator(nn.Module):
             fmap_gs.append(fmap_g)
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+            # fmap_rs is real, fmap_gs is generated. 
+
+class MultiScaleDiscriminator_JETS(nn.Module):
+    def __init__(self):
+        super(MultiScaleDiscriminator_JETS, self).__init__()
+
+        self.discriminators = nn.ModuleList(
+            [
+                DiscriminatorS(use_spectral_norm=True),
+                DiscriminatorS(),
+                DiscriminatorS(),
+            ]
+        )
+
+        self.meanpools = nn.ModuleList(
+            [AvgPool1d(4, 2, padding=2), AvgPool1d(4, 2, padding=2)]
+        )
+
+    def forward(self, y):
+        y_d_rs = []     # p, y, groud-truth
+        fmap_rs = []
+
+        for i, d in enumerate(self.discriminators):
+            if i != 0:
+                y = self.meanpools[i - 1](y)
+            y_d_r, fmap_r = d(y)
+            y_d_rs.append(y_d_r)
+            fmap_rs.append(fmap_r)
+
+
+        return y_d_rs, fmap_rs
+            # fmap_rs is real, fmap_gs is generated. 
