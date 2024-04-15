@@ -5,6 +5,7 @@
 
 import random
 import torch
+import torchaudio
 from torch.nn.utils.rnn import pad_sequence
 from utils.data_utils import *
 from models.base.base_dataset import (
@@ -97,6 +98,22 @@ class FS2Dataset(BaseOfflineDataset):
                 self.speaker_map = json.load(f)
 
         self.metadata = self.check_metadata()
+        if cfg.use_audio:
+            self.utt2audio_path = {}
+            for utt_info in self.metadata:
+                dataset = utt_info["Dataset"]
+                uid = utt_info["Uid"]
+                utt = "{}_{}".format(dataset, uid)
+
+                if cfg.extract_audio:
+                    self.utt2audio_path[utt] = os.path.join(
+                        cfg.processed_dir,
+                        dataset,
+                        cfg.audio_dir,
+                        uid + ".wav",
+                    )
+                else:
+                    self.utt2audio_path[utt] = utt_info["Path"]
 
     def __getitem__(self, index):
         single_feature = BaseOfflineDataset.__getitem__(self, index)
@@ -143,6 +160,12 @@ class FS2Dataset(BaseOfflineDataset):
                 "uid": uid,
             }
         )
+        
+        if self.cfg.preprocess.use_audio:
+            audio, sr = torchaudio.load(self.utt2audio_path[utt])
+            audio = audio.cpu().numpy().squeeze()
+            single_feature["audio"] = audio
+            single_feature["audio_len"] = audio.shape[0]        
         return self.clip_if_too_long(single_feature)
 
     def read_duration(self):

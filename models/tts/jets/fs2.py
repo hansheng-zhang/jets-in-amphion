@@ -436,8 +436,8 @@ class FastSpeech2(nn.Module):
 
         # Define HiFiGAN generator
         hifi_cfg = load_config("egs/vocoder/gan/hifigan/exp_config.json")
-        hifi_cfg.model.hifigan.resblock_kernel_sizes = [3, 7, 11]
-        hifi_cfg.preprocess.n_mel = cfg.preprocess.n_mel
+        # hifi_cfg.model.hifigan.resblock_kernel_sizes = [3, 7, 11]
+        hifi_cfg.preprocess.n_mel = attention_dim
         self.generator = HiFiGAN(hifi_cfg)
 
     def _source_mask(self, ilens: torch.Tensor) -> torch.Tensor:
