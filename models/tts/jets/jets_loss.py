@@ -45,11 +45,8 @@ class GeneratorAdversarialLoss(torch.nn.Module):
 class FeatureMatchLoss(torch.nn.Module):
     """Feature matching loss module."""
 
-    def __init__(self,average_by_layers: bool = True,average_by_discriminators: bool = True,include_final_outputs: bool = False):
+    def __init__(self):
         super().__init__()
-        self.average_by_layers = average_by_layers
-        self.average_by_discriminators = average_by_discriminators
-        self.include_final_outputs = include_final_outputs
 
     def forward(self, feats_hat, feats) -> torch.Tensor:
         feat_match_loss = 0.0
@@ -87,7 +84,6 @@ class DurationPredictorLoss(torch.nn.Module):
         loss = self.criterion(outputs, targets)
 
         return loss
-
 
 class VarianceLoss(torch.nn.Module):
     def __init__(self):
@@ -262,12 +258,18 @@ class GeneratorLoss(nn.Module):
         super().__init__()
         self.cfg = cfg
         
-        self.mel_loss = MelSpectrogramLoss(cfg.mel_loss_params)
-        self.generator_adv_loss = GeneratorAdversarialLoss(cfg.generator_adv_loss_params)
-        self.feat_match_loss = FeatureMatchLoss(cfg.feat_match_loss_params)
+        self.mel_loss = MelSpectrogramLoss()
+        self.generator_adv_loss = GeneratorAdversarialLoss()
+        self.feat_match_loss = FeatureMatchLoss()
         self.var_loss = VarianceLoss()
         self.forwardsum_loss = ForwardSumLoss()
 
+        self.lambda_adv = cfg.lambda_adv
+        self.lambda_mel = cfg.lambda_mel
+        self.lambda_feat_match = cfg.lambda_feat_match
+        self.lambda_var = cfg.lambda_var
+        self.lambda_align = cfg.lambda_align
+    
     def forward(
         self,
         outputs_g,
@@ -275,6 +277,7 @@ class GeneratorLoss(nn.Module):
         speech
     ):
         loss_g = {}
+        
         (
         speech_hat_,
         bin_loss,
@@ -289,15 +292,18 @@ class GeneratorLoss(nn.Module):
         text_lengths,
         feats_lengths
         ) = outputs_g
+        
         (
         p,
         p_hat
         ) = outputs_d
+        
         speech_ = get_segments(
                 x=speech,
                 start_idxs=start_idxs * self.generator.upsample_factor,
                 segment_size=self.generator.segment_size * self.generator.upsample_factor,
-            )
+        )
+        
         mel_loss = self.mel_loss(speech_hat_, speech_)
         adv_loss = self.generator_adv_loss(p_hat)
         feat_match_loss = self.feat_match_loss(p_hat, p)
