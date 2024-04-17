@@ -298,10 +298,12 @@ class GeneratorLoss(nn.Module):
         p_hat
         ) = outputs_d
         
+        upsample_factor = int(np.prod([8, 8, 2, 2]))
+        segment_size = 64
         speech_ = get_segments(
                 x=speech,
-                start_idxs=start_idxs * self.generator.upsample_factor,
-                segment_size=self.generator.segment_size * self.generator.upsample_factor,
+                start_idxs=start_idxs * upsample_factor,
+                segment_size=segment_size * upsample_factor,
         )
         
         mel_loss = self.mel_loss(speech_hat_, speech_)
