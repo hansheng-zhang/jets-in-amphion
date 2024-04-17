@@ -264,11 +264,11 @@ class GeneratorLoss(nn.Module):
         self.var_loss = VarianceLoss()
         self.forwardsum_loss = ForwardSumLoss()
 
-        self.lambda_adv = cfg.lambda_adv
-        self.lambda_mel = cfg.lambda_mel
-        self.lambda_feat_match = cfg.lambda_feat_match
-        self.lambda_var = cfg.lambda_var
-        self.lambda_align = cfg.lambda_align
+        self.lambda_adv = 1.0
+        self.lambda_mel = 45.0
+        self.lambda_feat_match = 2.0
+        self.lambda_var = 1.0
+        self.lambda_align = 2.0
     
     def forward(
         self,
