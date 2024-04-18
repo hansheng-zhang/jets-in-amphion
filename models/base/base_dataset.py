@@ -256,10 +256,10 @@ class BaseOfflineDataset(torch.utils.data.Dataset):
             )
             single_feature["frame_energy"] = aligned_frame_energy
 
-        if self.cfg.preprocess.use_audio:
-            audio = np.load(self.utt2audio_path[utt])
-            single_feature["audio"] = audio
-            single_feature["audio_len"] = audio.shape[0]
+        # if self.cfg.preprocess.use_audio:
+        #     audio = np.load(self.utt2audio_path[utt])
+        #     single_feature["audio"] = audio
+        #     single_feature["audio_len"] = audio.shape[0]
 
         if self.cfg.preprocess.use_phone or self.cfg.preprocess.use_text:
             single_feature["phone_seq"] = np.array(self.utt2seq[utt])

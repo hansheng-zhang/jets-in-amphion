@@ -288,6 +288,10 @@ class FS2Collator(BaseOfflineCollator):
                 )
             elif key == "uid":
                 packed_batch_features[key] = [b["uid"] for b in batch]
+            elif key == "audio_len":
+                packed_batch_features["audio_len"] = torch.LongTensor(
+                    [b["audio_len"] for b in batch]
+                )
             else:
                 values = [torch.from_numpy(b[key]) for b in batch]
                 packed_batch_features[key] = pad_sequence(
