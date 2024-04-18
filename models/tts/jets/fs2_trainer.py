@@ -11,6 +11,7 @@ from models.tts.fastspeech2.fs2 import FastSpeech2
 from models.tts.fastspeech2.jets_loss import GeneratorLoss, DiscriminatorLoss
 from models.tts.fastspeech2.fs2_dataset import FS2Dataset, FS2Collator
 from optimizer.optimizers import NoamLR
+from torch.optim.lr_scheduler import ExponentialLR
 from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
 
 
@@ -25,15 +26,47 @@ class FastSpeech2Trainer(TTSTrainer):
     def __build_scheduler(self):
         return NoamLR(self.optimizer, **self.cfg.train.lr_scheduler)
 
-    def _write_summary(self, losses, stats):
+    def _write_summary(
+        self,
+        losses,
+        stats,
+        images={},
+        audios={},
+        audio_sampling_rate=24000,
+        tag="train",
+    ):
+        for key, value in losses.items():
+            self.sw.add_scalar(tag + "/" + key, value, self.step)
+        self.sw.add_scalar(
+            "learning_rate",
+            self.optimizer["optimizer_g"].param_groups[0]["lr"],
+            self.step,
+        )
+
+        if len(images) != 0:
+            for key, value in images.items():
+                self.sw.add_image(key, value, self.global_step, batchformats="HWC")
+        if len(audios) != 0:
+            for key, value in audios.items():
+                self.sw.add_audio(key, value, self.global_step, audio_sampling_rate)
+
         for key, value in losses.items():
             self.sw.add_scalar("train/" + key, value, self.step)
         lr = self.optimizer.state_dict()["param_groups"][0]["lr"]
         self.sw.add_scalar("learning_rate", lr, self.step)
 
-    def _write_valid_summary(self, losses, stats):
+    def _write_valid_summary(
+        self, losses, stats, images={}, audios={}, audio_sampling_rate=24000, tag="val"
+    ):
         for key, value in losses.items():
-            self.sw.add_scalar("val/" + key, value, self.step)
+            self.sw.add_scalar(tag + "/" + key, value, self.step)
+
+        if len(images) != 0:
+            for key, value in images.items():
+                self.sw.add_image(key, value, self.global_step, batchformats="HWC")
+        if len(audios) != 0:
+            for key, value in audios.items():
+                self.sw.add_audio(key, value, self.global_step, audio_sampling_rate)
 
     def _build_criterion(self):
         criterion = {
@@ -44,9 +77,12 @@ class FastSpeech2Trainer(TTSTrainer):
 
     def get_state_dict(self):
         state_dict = {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
+            "generator": self.model["generator"].state_dict(),
+            "discriminator": self.model["discriminator"].state_dict(),
+            "optimizer_g": self.optimizer["optimizer_g"].state_dict(),
+            "optimizer_d": self.optimizer["optimizer_d"].state_dict(),
+            "scheduler_g": self.scheduler["scheduler_g"].state_dict(),
+            "scheduler_d": self.scheduler["scheduler_d"].state_dict(),
             "step": self.step,
             "epoch": self.epoch,
             "batch_size": self.cfg.train.batch_size,
@@ -71,7 +107,18 @@ class FastSpeech2Trainer(TTSTrainer):
         return optimizer
 
     def _build_scheduler(self):
-        scheduler = NoamLR(self.optimizer, **self.cfg.train.lr_scheduler)
+        scheduler_g = ExponentialLR(
+            self.optimizer["optimizer_g"],
+            gamma=self.cfg.train.lr_decay,
+            last_epoch=self.epoch - 1,
+        )
+        scheduler_d = ExponentialLR(
+            self.optimizer["optimizer_d"],
+            gamma=self.cfg.train.lr_decay,
+            last_epoch=self.epoch - 1,
+        )
+
+        scheduler = {"scheduler_g": scheduler_g, "scheduler_d": scheduler_d}
         return scheduler
 
     def _build_model(self):
@@ -84,10 +131,11 @@ class FastSpeech2Trainer(TTSTrainer):
         r"""Training epoch. Should return average loss of a batch (sample) over
         one epoch. See ``train_loop`` for usage.
         """
-        self.model.train()
+        self.model["generator"].train()
+        self.model["discriminator"].train()
         epoch_sum_loss: float = 0.0
-        epoch_step: int = 0
         epoch_losses: dict = {}
+        epoch_step: int = 0
         for batch in tqdm(
             self.train_dataloader,
             desc=f"Training Epoch {self.epoch}",
@@ -98,20 +146,12 @@ class FastSpeech2Trainer(TTSTrainer):
             smoothing=0.04,
             disable=not self.accelerator.is_main_process,
         ):
-            # Do training step and BP
             with self.accelerator.accumulate(self.model):
-                loss, train_losses = self._train_step(batch)
-                self.accelerator.backward(loss)
-                grad_clip_thresh = self.cfg.train.grad_clip_thresh
-                nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_thresh)
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+                total_loss, train_losses, training_stats = self._train_step(batch)
             self.batch_count += 1
 
-            # Update info for each step
             if self.batch_count % self.cfg.train.gradient_accumulation_step == 0:
-                epoch_sum_loss += loss
+                epoch_sum_loss += total_loss
                 for key, value in train_losses.items():
                     if key not in epoch_losses.keys():
                         epoch_losses[key] = value
@@ -120,8 +160,14 @@ class FastSpeech2Trainer(TTSTrainer):
 
                 self.accelerator.log(
                     {
-                        "Step/Train Loss": loss,
-                        "Step/Learning Rate": self.optimizer.param_groups[0]["lr"],
+                        "Step/Generator Loss": train_losses["loss_gen_all"],
+                        "Step/Discriminator Loss": train_losses["loss_disc_all"],
+                        "Step/Generator Learning Rate": self.optimizer[
+                            "optimizer_d"
+                        ].param_groups[0]["lr"],
+                        "Step/Discriminator Learning Rate": self.optimizer[
+                            "optimizer_g"
+                        ].param_groups[0]["lr"],
                     },
                     step=self.step,
                 )
@@ -142,6 +188,7 @@ class FastSpeech2Trainer(TTSTrainer):
                 / len(self.train_dataloader)
                 * self.cfg.train.gradient_accumulation_step
             )
+
         return epoch_sum_loss, epoch_losses
 
     def _train_step(self, batch):
