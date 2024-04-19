@@ -206,7 +206,8 @@ class FastSpeech2Trainer(TTSTrainer):
         speech_hat_, *_ = outputs_g
 
         # Discriminator output
-        p = self.model["discriminator"](batch["audio"])
+        speech = batch["audio"].unsqueeze(1)
+        p = self.model["discriminator"](speech)
         p_hat = self.model["discriminator"](speech_hat_.detach())
         ##  Discriminator loss
         loss_d = self.criterion["discriminator"](p, p_hat)
@@ -218,10 +219,10 @@ class FastSpeech2Trainer(TTSTrainer):
         self.optimizer["optimizer_d"].step()
 
         ## Train Generator
-        p = self.model["discriminator"](batch["audio"].detach())
+        p = self.model["discriminator"](speech.detach())
         p_hat = self.model["discriminator"](speech_hat_)
         outputs_d = (p, p_hat)
-        loss_g = self.criterion["generator"](outputs_g, outputs_d, batch["audio"])
+        loss_g = self.criterion["generator"](outputs_g, outputs_d, speech)
         train_losses.update(loss_g)
 
         # BP and Grad Updated

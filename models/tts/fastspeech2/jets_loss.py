@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
+import librosa
 
 def get_segments(
     x: torch.Tensor,
@@ -176,6 +177,7 @@ class MelSpectrogramLoss(torch.nn.Module):
         center: bool = True,
         normalized: bool = False,
         onesided: bool = True,
+        htk: bool = False,
     ):
         """Initialize Mel-spectrogram loss.
 
@@ -198,7 +200,7 @@ class MelSpectrogramLoss(torch.nn.Module):
         self.fs=fs
         self.n_fft=n_fft
         self.hop_length=hop_length
-        self.win_length=win_length
+        self.win_length=n_fft
         self.window=window
         self.n_mels=n_mels
         self.fmin = 0 if fmin is None else fmin
@@ -206,6 +208,7 @@ class MelSpectrogramLoss(torch.nn.Module):
         self.center=center
         self.normalized=normalized
         self.onesided=onesided
+        self.htk=htk
     
     def logmel(self, feat):
         mel_options = dict(
@@ -217,22 +220,30 @@ class MelSpectrogramLoss(torch.nn.Module):
             htk=self.htk,
         )
         melmat = librosa.filters.mel(**mel_options)
+        melmat = torch.from_numpy(melmat.T).float()
         mel_feat = torch.matmul(feat, melmat)
         mel_feat = torch.clamp(mel_feat, min=1e-10)
         logmel_feat = mel_feat.log10() 
         return logmel_feat
     
     def wav_to_mel(self, input):
+        if self.window is not None:
+            window_func = getattr(torch, f"{self.window}_window")
+            window = window_func(
+                self.win_length, dtype=input.dtype, device=input.device
+            )
         stft_kwargs = dict(
             n_fft=self.n_fft,
             win_length=self.win_length,
             hop_length=self.hop_length,
             center=self.center,
-            window=self.window,
+            window=window,
             normalized=self.normalized,
             onesided=self.onesided,
+            return_complex=True,
         )
         input_stft = torch.stft(input, **stft_kwargs)
+        input_stft = torch.view_as_real(input_stft)
         input_power = input_stft[..., 0] ** 2 + input_stft[..., 1] ** 2
         input_amp = torch.sqrt(torch.clamp(input_power, min=1.0e-10))
         input_feats = self.logmel(input_amp)
@@ -415,12 +426,10 @@ class DiscriminatorLoss(torch.nn.Module):
     def forward(self, speech_real, speech_generated):
         loss_d = {}
 
-        disc_real_outputs = self.discriminator(speech_real)
-        disc_generated_outputs = self.discriminator(speech_generated)
         loss = 0
         r_losses = []
         g_losses = []
-        for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        for dr, dg in zip(speech_real, speech_generated):
             dr = dr.float()
             dg = dg.float()
             r_loss = torch.mean((1 - dr) ** 2)

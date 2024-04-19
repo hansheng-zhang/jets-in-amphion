@@ -297,15 +297,15 @@ class MultiScaleMultiPeriodDiscriminator(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
         super(MultiScaleMultiPeriodDiscriminator, self).__init__()
 
-        self.msd = MultiPeriodDiscriminator_JETS()
-        self.mpd = MultiScaleDiscriminator_JETS()
+        self.msd = MultiScaleDiscriminator_JETS()
+        self.mpd = MultiPeriodDiscriminator_JETS()
 
     def forward(self, y):
 
-        _, msd_fmap_rs = self.msd(y)
+        msd_y_d_rs, _ = self.msd(y)
         # msd_outs = self.msd(y, y_hat)
-        _, mpd_fmap_rs= self.mpd(y)
+        mpd_y_d_rs, _ = self.mpd(y)
         # mpd_outs = self.mpd(y, y_hat)
-        return msd_fmap_rs + mpd_fmap_rs
+        return msd_y_d_rs + mpd_y_d_rs
         # ground_truth, generated
         # return msd_outs + mpd_outs
