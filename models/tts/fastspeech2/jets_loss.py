@@ -4,30 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
 import librosa
 
-def get_segments(
-    x: torch.Tensor,
-    start_idxs: torch.Tensor,
-    segment_size: int,
-) -> torch.Tensor:
-    """Get segments.
-
-    Args:
-        x (Tensor): Input tensor (B, C, T).
-        start_idxs (Tensor): Start index tensor (B,).
-        segment_size (int): Segment size.
-
-    Returns:
-        Tensor: Segmented tensor (B, C, segment_size).
-
-    """
-    b, c, t = x.size()
-    segments = x.new_zeros(b, c, segment_size)
-    for i, start_idx in enumerate(start_idxs):
-        segments[i] = x[i, :, start_idx : start_idx + segment_size]
-    return segments
+from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
+from models.tts.fastspeech2.alignments import make_non_pad_mask
 
 class GeneratorAdversarialLoss(torch.nn.Module):
     """Generator adversarial loss module."""
@@ -46,18 +26,60 @@ class GeneratorAdversarialLoss(torch.nn.Module):
 class FeatureMatchLoss(torch.nn.Module):
     """Feature matching loss module."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        average_by_layers: bool = False,
+        average_by_discriminators: bool = False,
+        include_final_outputs: bool = True,
+    ):
+        """Initialize FeatureMatchLoss module.
 
-    def forward(self, feats_hat, feats) -> torch.Tensor:
+        Args:
+            average_by_layers (bool): Whether to average the loss by the number
+                of layers.
+            average_by_discriminators (bool): Whether to average the loss by
+                the number of discriminators.
+            include_final_outputs (bool): Whether to include the final output of
+                each discriminator for loss calculation.
+
+        """
+        super().__init__()
+        self.average_by_layers = average_by_layers
+        self.average_by_discriminators = average_by_discriminators
+        self.include_final_outputs = include_final_outputs
+
+    def forward(
+        self,
+        feats_hat: Union[List[List[torch.Tensor]], List[torch.Tensor]],
+        feats: Union[List[List[torch.Tensor]], List[torch.Tensor]],
+    ) -> torch.Tensor:
+        """Calculate feature matching loss.
+
+        Args:
+            feats_hat (Union[List[List[Tensor]], List[Tensor]]): List of list of
+                discriminator outputs or list of discriminator outputs calcuated
+                from generator's outputs.
+            feats (Union[List[List[Tensor]], List[Tensor]]): List of list of
+                discriminator outputs or list of discriminator outputs calcuated
+                from groundtruth..
+
+        Returns:
+            Tensor: Feature matching loss value.
+
+        """
         feat_match_loss = 0.0
         for i, (feats_hat_, feats_) in enumerate(zip(feats_hat, feats)):
             feat_match_loss_ = 0.0
+            if not self.include_final_outputs:
+                feats_hat_ = feats_hat_[:-1]
+                feats_ = feats_[:-1]
             for j, (feat_hat_, feat_) in enumerate(zip(feats_hat_, feats_)):
                 feat_match_loss_ += F.l1_loss(feat_hat_, feat_.detach())
-            feat_match_loss_ /= j + 1
+            if self.average_by_layers:
+                feat_match_loss_ /= j + 1
             feat_match_loss += feat_match_loss_
-        feat_match_loss /= i + 1
+        if self.average_by_discriminators:
+            feat_match_loss /= i + 1
 
         return feat_match_loss
 
@@ -109,11 +131,12 @@ class VarianceLoss(torch.nn.Module):
         duration_masks = make_non_pad_mask(ilens).to(ds.device)
         d_outs = d_outs.masked_select(duration_masks)
         ds = ds.masked_select(duration_masks)
-        pitch_masks = make_non_pad_mask(ilens).unsqueeze(-1).to(ds.device)
+        pitch_masks = make_non_pad_mask(ilens).to(ds.device)
+        pitch_masks_ = make_non_pad_mask(ilens).unsqueeze(-1).to(ds.device)
         p_outs = p_outs.masked_select(pitch_masks)
         e_outs = e_outs.masked_select(pitch_masks)
-        ps = ps.masked_select(pitch_masks)
-        es = es.masked_select(pitch_masks)
+        ps = ps.masked_select(pitch_masks_)
+        es = es.masked_select(pitch_masks_)
 
         # calculate loss
         duration_loss = self.duration_criterion(d_outs, ds)
@@ -220,7 +243,7 @@ class MelSpectrogramLoss(torch.nn.Module):
             htk=self.htk,
         )
         melmat = librosa.filters.mel(**mel_options)
-        melmat = torch.from_numpy(melmat.T).float()
+        melmat = torch.from_numpy(melmat.T).float().to(feat.device)
         mel_feat = torch.matmul(feat, melmat)
         mel_feat = torch.clamp(mel_feat, min=1e-10)
         logmel_feat = mel_feat.log10() 
@@ -232,6 +255,7 @@ class MelSpectrogramLoss(torch.nn.Module):
             window = window_func(
                 self.win_length, dtype=input.dtype, device=input.device
             )
+        
         stft_kwargs = dict(
             n_fft=self.n_fft,
             win_length=self.win_length,
@@ -242,8 +266,22 @@ class MelSpectrogramLoss(torch.nn.Module):
             onesided=self.onesided,
             return_complex=True,
         )
+        
+        bs = input.size(0)
+        if input.dim() == 3:
+            multi_channel = True
+            # input: (Batch, Nsample, Channels) -> (Batch * Channels, Nsample)
+            input = input.transpose(1, 2).reshape(-1, input.size(1))
+        else:
+            multi_channel = False
+        
         input_stft = torch.stft(input, **stft_kwargs)
         input_stft = torch.view_as_real(input_stft)
+        input_stft = input_stft.transpose(1, 2)
+        if multi_channel:
+            input_stft = input_stft.view(bs, -1, input_stft.size(1), input_stft.size(2), 2).transpose(
+                1, 2
+            )
         input_power = input_stft[..., 0] ** 2 + input_stft[..., 1] ** 2
         input_amp = torch.sqrt(torch.clamp(input_power, min=1.0e-10))
         input_feats = self.logmel(input_amp)
@@ -285,7 +323,7 @@ class GeneratorLoss(nn.Module):
         self,
         outputs_g,
         outputs_d,
-        speech
+        speech_
     ):
         loss_g = {}
         
@@ -305,17 +343,9 @@ class GeneratorLoss(nn.Module):
         ) = outputs_g
         
         (
-        p,
-        p_hat
+        p_hat,
+        p
         ) = outputs_d
-        
-        upsample_factor = int(np.prod([8, 8, 2, 2]))
-        segment_size = 64
-        speech_ = get_segments(
-                x=speech,
-                start_idxs=start_idxs * upsample_factor,
-                segment_size=segment_size * upsample_factor,
-        )
         
         mel_loss = self.mel_loss(speech_hat_, speech_)
         adv_loss = self.generator_adv_loss(p_hat)
@@ -323,19 +353,24 @@ class GeneratorLoss(nn.Module):
         dur_loss, pitch_loss, energy_loss = self.var_loss(
             d_outs, ds, p_outs, ps, e_outs, es, text_lengths
         )
-        
         forwardsum_loss = self.forwardsum_loss(log_p_attn, text_lengths, feats_lengths)
 
         mel_loss = mel_loss * self.lambda_mel
+        loss_g["mel_loss"] = mel_loss
         adv_loss = adv_loss * self.lambda_adv
+        loss_g["adv_loss"] = adv_loss
         feat_match_loss = feat_match_loss * self.lambda_feat_match
+        loss_g["feat_match_loss"] = feat_match_loss
         g_loss = mel_loss + adv_loss + feat_match_loss
+        loss_g["g_loss"] = g_loss
         var_loss = (dur_loss + pitch_loss + energy_loss) * self.lambda_var
+        loss_g["var_loss"] = var_loss
         align_loss = (forwardsum_loss + bin_loss) * self.lambda_align
+        loss_g["align_loss"] = align_loss
 
-        loss = g_loss + var_loss + align_loss
+        g_total_loss = g_loss + var_loss + align_loss
 
-        loss_g["loss_gen_all"] = loss
+        loss_g["g_total_loss"] = g_total_loss
 
         return loss_g
     

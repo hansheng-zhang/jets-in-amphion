@@ -14,6 +14,27 @@ from optimizer.optimizers import NoamLR
 from torch.optim.lr_scheduler import ExponentialLR
 from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
 
+def get_segments(
+    x: torch.Tensor,
+    start_idxs: torch.Tensor,
+    segment_size: int,
+) -> torch.Tensor:
+    """Get segments.
+
+    Args:
+        x (Tensor): Input tensor (B, C, T).
+        start_idxs (Tensor): Start index tensor (B,).
+        segment_size (int): Segment size.
+
+    Returns:
+        Tensor: Segmented tensor (B, C, segment_size).
+
+    """
+    b, c, t = x.size()
+    segments = x.new_zeros(b, c, segment_size)
+    for i, start_idx in enumerate(start_idxs):
+        segments[i] = x[i, :, start_idx : start_idx + segment_size]
+    return segments
 
 class FastSpeech2Trainer(TTSTrainer):
     def __init__(self, args, cfg):
@@ -160,7 +181,7 @@ class FastSpeech2Trainer(TTSTrainer):
 
                 self.accelerator.log(
                     {
-                        "Step/Generator Loss": train_losses["loss_gen_all"],
+                        "Step/Generator Loss": train_losses["g_total_loss"],
                         "Step/Discriminator Loss": train_losses["loss_disc_all"],
                         "Step/Generator Learning Rate": self.optimizer[
                             "optimizer_d"
@@ -196,10 +217,6 @@ class FastSpeech2Trainer(TTSTrainer):
         total_loss = 0
         training_stats = {}
 
-        # batch["linear"] = batch["linear"].transpose(2, 1)  # [b, d, t]
-        # batch["mel"] = batch["mel"].transpose(2, 1)  # [b, d, t]
-        # batch["audio"] = batch["audio"].unsqueeze(1)  # [b, d, t]
-
         # Train Discriminator
         # Generator output
         outputs_g = self.model["generator"](batch)
@@ -207,8 +224,17 @@ class FastSpeech2Trainer(TTSTrainer):
 
         # Discriminator output
         speech = batch["audio"].unsqueeze(1)
-        p = self.model["discriminator"](speech)
+        upsample_factor = 256
+        segment_size = 64
+        _, _, _, start_idxs, *_ = outputs_g
+        speech_ = get_segments(
+            x=speech,
+            start_idxs=start_idxs * upsample_factor,
+            segment_size=segment_size * upsample_factor,
+        )
         p_hat = self.model["discriminator"](speech_hat_.detach())
+        p = self.model["discriminator"](speech_)
+
         ##  Discriminator loss
         loss_d = self.criterion["discriminator"](p, p_hat)
         train_losses.update(loss_d)
@@ -219,21 +245,23 @@ class FastSpeech2Trainer(TTSTrainer):
         self.optimizer["optimizer_d"].step()
 
         ## Train Generator
-        p = self.model["discriminator"](speech.detach())
         p_hat = self.model["discriminator"](speech_hat_)
-        outputs_d = (p, p_hat)
-        loss_g = self.criterion["generator"](outputs_g, outputs_d, speech)
+        with torch.no_grad():
+            p = self.model["discriminator"](speech_)
+        
+        outputs_d = (p_hat, p)
+        loss_g = self.criterion["generator"](outputs_g, outputs_d, speech_)
         train_losses.update(loss_g)
 
         # BP and Grad Updated
         self.optimizer["optimizer_g"].zero_grad()
-        self.accelerator.backward(loss_g["loss_gen_all"])
+        self.accelerator.backward(loss_g["g_total_loss"])
         self.optimizer["optimizer_g"].step()
 
         for item in train_losses:
             train_losses[item] = train_losses[item].item()
 
-        total_loss = loss_g["loss_gen_all"] + loss_d["loss_disc_all"]
+        total_loss = loss_g["g_total_loss"] + loss_d["loss_disc_all"]
 
         return (
             total_loss.item(),
@@ -241,18 +269,50 @@ class FastSpeech2Trainer(TTSTrainer):
             training_stats,
         )
 
-    @torch.no_grad()
-    def _valid_step(self, data):
-        valid_loss = {}
-        total_valid_loss = 0
+    @torch.inference_mode()
+    def _valid_step(self, batch):
+        valid_losses = {}
+        total_loss = 0
         valid_stats = {}
 
-        preds = self.model(data)
+        # Discriminator
+        # Generator output
+        outputs_g = self.model["generator"](batch)
+        speech_hat_, *_ = outputs_g
 
-        valid_losses = self.criterion(data, preds)
+        # Discriminator output
+        speech = batch["audio"].unsqueeze(1)
+        upsample_factor = 256
+        segment_size = 64
+        _, _, _, start_idxs, *_ = outputs_g
+        speech_ = get_segments(
+            x=speech,
+            start_idxs=start_idxs * upsample_factor,
+            segment_size=segment_size * upsample_factor,
+        )
+        p_hat = self.model["discriminator"](speech_hat_.detach())
+        p = self.model["discriminator"](speech_)
 
-        total_valid_loss = valid_losses["loss"]
-        for key, value in valid_losses.items():
-            valid_losses[key] = value.item()
+        ##  Discriminator loss
+        loss_d = self.criterion["discriminator"](p, p_hat)
+        valid_losses.update(loss_d)
 
-        return total_valid_loss, valid_losses, valid_stats
+        ## Generator
+        p_hat = self.model["discriminator"](speech_hat_)
+        with torch.no_grad():
+            p = self.model["discriminator"](speech_)
+        
+        outputs_d = (p_hat, p)
+        loss_g = self.criterion["generator"](outputs_g, outputs_d, speech_)
+        valid_losses.update(loss_g)
+
+        for item in valid_losses:
+            valid_losses[item] = valid_losses[item].item()
+
+        total_loss = loss_g["g_total_loss"] + loss_d["loss_disc_all"]
+
+        return (
+            total_loss.item(),
+            valid_losses,
+            valid_stats,
+        )

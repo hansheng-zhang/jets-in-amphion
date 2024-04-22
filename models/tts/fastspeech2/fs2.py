@@ -20,6 +20,7 @@ import json
 
 from utils.util import load_config
 
+
 def get_mask_from_lengths(lengths, max_len=None):
     device = lengths.device
     batch_size = lengths.shape[0]
@@ -30,7 +31,6 @@ def get_mask_from_lengths(lengths, max_len=None):
     mask = ids >= lengths.unsqueeze(1).expand(-1, max_len)
 
     return mask
-
 
 def pad(input_ele, mel_max_length=None):
     if mel_max_length:
@@ -535,5 +535,5 @@ class FastSpeech2(nn.Module):
         # forward generator
         wav = self.generator(z_segments)
 
-        return wav, bin_loss, log_p_attn, z_start_idxs, log_d_predictions, ds, p_predictions, ps, e_predictions, es, feats_lengths, len(texts)
+        return wav, bin_loss, log_p_attn, z_start_idxs, log_d_predictions, ds, p_predictions, ps, e_predictions, es, src_lens, feats_lengths
 
