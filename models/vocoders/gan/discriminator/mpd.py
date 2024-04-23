@@ -200,8 +200,8 @@ class DiscriminatorP_vits(torch.nn.Module):
             x = F.leaky_relu(x, LRELU_SLOPE)
             fmap.append(x)
         x = self.conv_post(x)
-        fmap.append(x)
         x = torch.flatten(x, 1, -1)
+        fmap.append(x)
 
         return x, fmap
 
@@ -302,10 +302,10 @@ class MultiScaleMultiPeriodDiscriminator(torch.nn.Module):
 
     def forward(self, y):
 
-        msd_y_d_rs, _ = self.msd(y)
+        _, msd_outs_d_rs = self.msd(y)
         # msd_outs = self.msd(y, y_hat)
-        mpd_y_d_rs, _ = self.mpd(y)
+        _, mpd_outs_d_rs = self.mpd(y)
         # mpd_outs = self.mpd(y, y_hat)
-        return msd_y_d_rs + mpd_y_d_rs
+        return msd_outs_d_rs + mpd_outs_d_rs
         # ground_truth, generated
         # return msd_outs + mpd_outs
