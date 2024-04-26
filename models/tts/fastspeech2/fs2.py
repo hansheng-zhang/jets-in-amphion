@@ -537,3 +537,56 @@ class FastSpeech2(nn.Module):
 
         return wav, bin_loss, log_p_attn, z_start_idxs, log_d_predictions, ds, p_predictions, ps, e_predictions, es, src_lens, feats_lengths
 
+    def inference(self, data, p_control=1.0, e_control=1.0, d_control=1.0):
+        speakers = data["spk_id"]
+        texts = data["texts"]
+        src_lens = data["text_len"]
+        max_src_len = max(src_lens)
+        mel_lens = data["target_len"] if "target_len" in data else None
+        feats_lengths = mel_lens
+        max_mel_len = max(mel_lens) if "target_len" in data else None
+        p_targets = data["pitch"] if "pitch" in data else None
+        e_targets = data["energy"] if "energy" in data else None
+        d_targets = data["durations"] if "durations" in data else None
+        src_masks = get_mask_from_lengths(src_lens, max_src_len)
+        mel_masks = (
+            get_mask_from_lengths(mel_lens, max_mel_len)
+            if mel_lens is not None
+            else None
+        )
+
+        output = self.encoder(texts, src_masks)
+
+        if self.speaker_emb is not None:
+            output = output + self.speaker_emb(speakers).unsqueeze(1).expand(
+                -1, max_src_len, -1
+            )
+
+        (
+            output,
+            p_predictions,
+            e_predictions,
+            log_d_predictions,
+            d_rounded,
+            mel_lens,
+            mel_masks,
+        ) = self.variance_adaptor(
+            output,
+            src_masks,
+            mel_masks,
+            max_mel_len,
+            p_targets,
+            e_targets,
+            d_targets,
+            p_control,
+            e_control,
+            d_control,
+        )
+
+        # forward decoder
+        # h_masks = self._source_mask(feats_lengths)
+        zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
+
+        # forward generator
+        wav = self.generator(zs.transpose(1,2))
+        return wav, log_d_predictions
