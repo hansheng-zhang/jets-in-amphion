@@ -57,16 +57,17 @@ class FastSpeech2Inference(TTSInference):
             ):
                 outputs = self.model.inference(batch_data)
 
-                audios, masks = outputs
+                audios, d_predictions = outputs
+                d_predictions = d_predictions.unsqueeze(-1)
 
                 for idx in range(audios.size(0)):
                     audio = audios[idx, 0, :].data.cpu().float()
-                    # mask = masks[idx, :, :]
-                    # audio_length = (
-                    #     mask.sum([0, 1]).long() * self.cfg.preprocess.hop_size
-                    # )
-                    # audio_length = audio_length.cpu().numpy()
-                    # audio = audio[:audio_length]
+                    duration = d_predictions[idx, :, :]
+                    audio_length = (
+                        duration.sum([0, 1]).long() * self.cfg.preprocess.hop_size
+                    )
+                    audio_length = audio_length.cpu().numpy()
+                    audio = audio[:audio_length]
                     pred_res.append(audio)
 
         return pred_res

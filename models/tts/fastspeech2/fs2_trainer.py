@@ -168,6 +168,9 @@ class FastSpeech2Trainer(TTSTrainer):
             disable=not self.accelerator.is_main_process,
         ):
             with self.accelerator.accumulate(self.model):
+                segment_size = 64
+                if batch["target_len"].min() < segment_size:
+                    continue
                 total_loss, train_losses, training_stats = self._train_step(batch)
             self.batch_count += 1
 

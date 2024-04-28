@@ -583,10 +583,16 @@ class FastSpeech2(nn.Module):
             d_control,
         )
 
+        # Duration predictor inference mode: log_d_pred to d_pred
+        offset = 1.0
+        d_predictions = torch.clamp(
+                torch.round(log_d_predictions.exp() - offset), min=0
+            ).long()  # avoid negative value
+
         # forward decoder
         # h_masks = self._source_mask(feats_lengths)
         zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
 
         # forward generator
         wav = self.generator(zs.transpose(1,2))
-        return wav, log_d_predictions
+        return wav, d_predictions
