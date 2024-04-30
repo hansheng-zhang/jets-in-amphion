@@ -459,7 +459,7 @@ class FastSpeech2(nn.Module):
 
         """
         x_masks = make_non_pad_mask(ilens).to(next(self.parameters()).device)
-        return x_masks.unsqueeze(-2)
+        return x_masks
     
     def forward(self, data, p_control=1.0, e_control=1.0, d_control=1.0):
         speakers = data["spk_id"]
@@ -488,18 +488,14 @@ class FastSpeech2(nn.Module):
             )
 
         # forward alignment module and obtain duration, averaged pitch, energy
-        # h_masks = make_pad_mask(text_lengths).to(hs.device)
         h_masks = make_pad_mask(src_lens).to(output.device)
-        # log_p_attn = self.alignment_module(hs, feats, h_masks)
         log_p_attn = self.alignment_module(output, feats, h_masks)
         ds, bin_loss = viterbi_decode(log_p_attn, src_lens, feats_lengths)
-        # ps = average_by_duration(ds, pitch.squeeze(-1), text_lengths, feats_lengths).unsqueeze(-1)
         ps = average_by_duration(ds, p_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
-        # es = average_by_duration(ds, energy.squeeze(-1), text_lengths, feats_lengths).unsqueeze(-1)
         es = average_by_duration(ds, e_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
 
         (
-            output,
+            _,
             p_predictions,
             e_predictions,
             log_d_predictions,
@@ -519,11 +515,19 @@ class FastSpeech2(nn.Module):
             d_control,
         )
 
+        # use groundtruth in training
+        p_embs = self.pitch_embed(ps.transpose(1, 2)).transpose(1, 2)
+        e_embs = self.energy_embed(es.transpose(1, 2)).transpose(1, 2)
+        output = output + e_embs + p_embs
 
+        # upsampling
+        h_masks = make_non_pad_mask(feats_lengths).to(output.device)
+        d_masks = make_non_pad_mask(src_lens).to(ds.device)
+        output = self.length_regulator(output, ds, h_masks, d_masks)  # (B, T_feats, adim)
 
         # forward decoder
-        # h_masks = self._source_mask(feats_lengths)
-        zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
+        h_masks = self._source_mask(feats_lengths)
+        zs, _ = self.decoder(output, h_masks)  # (B, T_feats, adim)
 
         # get random segments
         z_segments, z_start_idxs = get_random_segments(
@@ -589,9 +593,24 @@ class FastSpeech2(nn.Module):
                 torch.round(log_d_predictions.exp() - offset), min=0
             ).long()  # avoid negative value
 
+        p_embs = self.pitch_embed(p_predictions.transpose(1, 2)).transpose(1, 2)
+        e_embs = self.energy_embed(e_predictions.transpose(1, 2)).transpose(1, 2)
+        output = output + e_embs + p_embs
+
+        # upsampling
+        if feats_lengths is not None:
+            h_masks = make_non_pad_mask(feats_lengths).to(output.device)
+        else:
+            h_masks = None
+        d_masks = make_non_pad_mask(src_lens).to(d_predictions.device)
+        output = self.length_regulator(output, d_predictions, h_masks, d_masks)  # (B, T_feats, adim)
+
         # forward decoder
-        # h_masks = self._source_mask(feats_lengths)
-        zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
+        if feats_lengths is not None:
+            h_masks = self._source_mask(feats_lengths)
+        else:
+            h_masks = None
+        zs, _ = self.decoder(output, h_masks)  # (B, T_feats, adim)
 
         # forward generator
         wav = self.generator(zs.transpose(1,2))

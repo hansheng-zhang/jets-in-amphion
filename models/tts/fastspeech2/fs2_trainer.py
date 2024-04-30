@@ -5,6 +5,8 @@
 
 import torch
 import torch.nn as nn
+import os
+from utils.io import save_audio
 from tqdm import tqdm
 from models.tts.base import TTSTrainer
 from models.tts.fastspeech2.fs2 import FastSpeech2
@@ -182,19 +184,19 @@ class FastSpeech2Trainer(TTSTrainer):
                     else:
                         epoch_losses[key] += value
 
-                self.accelerator.log(
-                    {
-                        "Step/Generator Loss": train_losses["g_total_loss"],
-                        "Step/Discriminator Loss": train_losses["loss_disc_all"],
-                        "Step/Generator Learning Rate": self.optimizer[
-                            "optimizer_d"
-                        ].param_groups[0]["lr"],
-                        "Step/Discriminator Learning Rate": self.optimizer[
-                            "optimizer_g"
-                        ].param_groups[0]["lr"],
-                    },
-                    step=self.step,
-                )
+                    self.accelerator.log(
+                        {
+                            "Step/Train {} Loss".format(key): value,
+                            # "Step/Generator Learning Rate": self.optimizer[
+                            #     "optimizer_d"
+                            # ].param_groups[0]["lr"],
+                            # "Step/Discriminator Learning Rate": self.optimizer[
+                            #     "optimizer_g"
+                            # ].param_groups[0]["lr"],
+                        },
+                        step=self.step,
+                    )
+                
                 self.step += 1
                 epoch_step += 1
 
@@ -224,6 +226,25 @@ class FastSpeech2Trainer(TTSTrainer):
         # Generator output
         outputs_g = self.model["generator"](batch)
         speech_hat_, *_ = outputs_g
+
+        # output temp generator waveform during trainning (for debug)
+        # out_dir = os.path.join(self.args.output_dir, "temp")
+        # os.makedirs(out_dir, exist_ok=True)
+
+        # if (self.epoch % 10 == 0 and self.step % 100 == 0):
+        #     for i, wav in enumerate(speech_hat_):
+        #         uid = i
+        #         save_audio(
+        #             os.path.join(out_dir, f"{uid}.wav"),
+        #             wav.numpy(),
+        #             self.cfg.preprocess.sample_rate,
+        #             add_silence=True,
+        #             turn_up=True,
+        #         )
+        #         tmp_file = os.path.join(out_dir, f"{uid}.pt")
+        #         if os.path.exists(tmp_file):
+        #             os.remove(tmp_file)
+        #     print("Current Epoch: ", self.epoch, "Current step: ", self.step, "Saved to: ", out_dir)
 
         # Discriminator output
         speech = batch["audio"].unsqueeze(1)
@@ -319,3 +340,56 @@ class FastSpeech2Trainer(TTSTrainer):
             valid_losses,
             valid_stats,
         )
+
+    @torch.inference_mode()
+    def _valid_epoch(self):
+        r"""Testing epoch. Should return average loss of a batch (sample) over
+        one epoch. See ``train_loop`` for usage.
+        """
+        if isinstance(self.model, dict):
+            for key in self.model.keys():
+                self.model[key].eval()
+        else:
+            self.model.eval()
+
+        epoch_sum_loss = 0.0
+        epoch_losses = dict()
+        for batch in tqdm(
+            self.valid_dataloader,
+            desc=f"Validating Epoch {self.epoch}",
+            unit="batch",
+            colour="GREEN",
+            leave=False,
+            dynamic_ncols=True,
+            smoothing=0.04,
+            disable=not self.accelerator.is_main_process,
+        ):
+            total_loss, valid_losses, valid_stats = self._valid_step(batch)
+            epoch_sum_loss += total_loss
+            if isinstance(valid_losses, dict):
+                for key, value in valid_losses.items():
+                    if key not in epoch_losses.keys():
+                        epoch_losses[key] = value
+                    else:
+                        epoch_losses[key] += value
+
+                    self.accelerator.log(
+                        {
+                            "Step/Valid {} Loss".format(key): value,
+                            # "Step/Generator Learning Rate": self.optimizer[
+                            #     "optimizer_d"
+                            # ].param_groups[0]["lr"],
+                            # "Step/Discriminator Learning Rate": self.optimizer[
+                            #     "optimizer_g"
+                            # ].param_groups[0]["lr"],
+                        },
+                        step=self.step,
+                    )
+
+        epoch_sum_loss = epoch_sum_loss / len(self.valid_dataloader)
+        for key in epoch_losses.keys():
+            epoch_losses[key] = epoch_losses[key] / len(self.valid_dataloader)
+
+        self.accelerator.wait_for_everyone()
+
+        return epoch_sum_loss, epoch_losses
