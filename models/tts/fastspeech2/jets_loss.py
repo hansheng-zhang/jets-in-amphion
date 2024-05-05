@@ -7,7 +7,7 @@ import numpy as np
 import librosa
 
 from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
-from models.tts.fastspeech2.alignments import make_non_pad_mask
+from models.tts.fastspeech2.alignments import make_non_pad_mask, make_pad_mask
 
 class GeneratorAdversarialLoss(torch.nn.Module):
     """Generator adversarial loss module."""
@@ -247,7 +247,7 @@ class MelSpectrogramLoss(torch.nn.Module):
         self.onesided=onesided
         self.htk=htk
     
-    def logmel(self, feat):
+    def logmel(self, feat, ilens):
         mel_options = dict(
             sr=self.fs,
             n_fft=self.n_fft,
@@ -261,9 +261,19 @@ class MelSpectrogramLoss(torch.nn.Module):
         mel_feat = torch.matmul(feat, melmat)
         mel_feat = torch.clamp(mel_feat, min=1e-10)
         logmel_feat = mel_feat.log10() 
+
+        # Zero padding
+        if ilens is not None:
+            logmel_feat = logmel_feat.masked_fill(
+                make_pad_mask(ilens, logmel_feat, 1), 0.0
+            )
+        else:
+            ilens = feat.new_full(
+                [feat.size(0)], fill_value=feat.size(1), dtype=torch.long
+            )
         return logmel_feat
     
-    def wav_to_mel(self, input):
+    def wav_to_mel(self, input, input_lengths = None):
         if self.window is not None:
             window_func = getattr(torch, f"{self.window}_window")
             window = window_func(
@@ -296,9 +306,18 @@ class MelSpectrogramLoss(torch.nn.Module):
             input_stft = input_stft.view(bs, -1, input_stft.size(1), input_stft.size(2), 2).transpose(
                 1, 2
             )
+        if input_lengths is not None:
+            if self.center:
+                pad = self.n_fft // 2
+                input_lengths = input_lengths + 2 * pad
+
+            feats_lens = (input_lengths - self.n_fft) // self.hop_length + 1
+            input_stft.masked_fill_(make_pad_mask(feats_lens, input_stft, 1), 0.0)
+        else:
+            feats_lens = None
         input_power = input_stft[..., 0] ** 2 + input_stft[..., 1] ** 2
         input_amp = torch.sqrt(torch.clamp(input_power, min=1.0e-10))
-        input_feats = self.logmel(input_amp)
+        input_feats = self.logmel(input_amp, feats_lens)
         return input_feats
     
     def forward(
@@ -311,10 +330,6 @@ class MelSpectrogramLoss(torch.nn.Module):
         mel_loss = F.l1_loss(mel_hat, mel)
 
         return mel_loss
-
-
-
-
 
 class GeneratorLoss(nn.Module):
     def __init__(self, cfg):

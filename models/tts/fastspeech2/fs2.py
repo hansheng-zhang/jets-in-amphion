@@ -15,6 +15,7 @@ from collections import OrderedDict
 from models.tts.fastspeech2.alignments import AlignmentModule, viterbi_decode, average_by_duration, make_pad_mask, make_non_pad_mask, get_random_segments
 from models.tts.fastspeech2.length_regulator import GaussianUpsampling
 from models.vocoders.gan.generator.hifigan import HiFiGAN
+from models.tts.fastspeech2.jets_loss import MelSpectrogramLoss
 import os
 import json
 
@@ -439,6 +440,7 @@ class FastSpeech2(nn.Module):
         # hifi_cfg.model.hifigan.resblock_kernel_sizes = [3, 7, 11]
         hifi_cfg.preprocess.n_mel = attention_dim
         self.generator = HiFiGAN(hifi_cfg)
+        self.mel_loss = MelSpectrogramLoss()
 
     def _source_mask(self, ilens: torch.Tensor) -> torch.Tensor:
         """Make masks for self-attention.
@@ -466,8 +468,8 @@ class FastSpeech2(nn.Module):
         texts = data["texts"]
         src_lens = data["text_len"]
         max_src_len = max(src_lens)
-        feats = data["mel"]
         mel_lens = data["target_len"] if "target_len" in data else None
+        feats = self.mel_loss.wav_to_mel(data["audio"], data["audio_len"])
         feats_lengths = mel_lens
         max_mel_len = max(mel_lens) if "target_len" in data else None
         p_targets = data["pitch"] if "pitch" in data else None
@@ -526,8 +528,8 @@ class FastSpeech2(nn.Module):
         output = self.length_regulator(output, ds, h_masks, d_masks)  # (B, T_feats, adim)
 
         # forward decoder
-        h_masks = self._source_mask(feats_lengths)
-        zs, _ = self.decoder(output, h_masks)  # (B, T_feats, adim)
+        # h_masks = self._source_mask(feats_lengths)
+        zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
 
         # get random segments
         z_segments, z_start_idxs = get_random_segments(
