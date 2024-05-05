@@ -501,9 +501,7 @@ class FastSpeech2(nn.Module):
             p_predictions,
             e_predictions,
             log_d_predictions,
-            d_rounded,
-            mel_lens,
-            mel_masks,
+            *_
         ) = self.variance_adaptor(
             output,
             src_masks,
@@ -589,31 +587,8 @@ class FastSpeech2(nn.Module):
             d_control,
         )
 
-        # Duration predictor inference mode: log_d_pred to d_pred
-        offset = 1.0
-        d_predictions = torch.clamp(
-                torch.round(log_d_predictions.exp() - offset), min=0
-            ).long()  # avoid negative value
-
-        p_embs = self.pitch_embed(p_predictions.transpose(1, 2)).transpose(1, 2)
-        e_embs = self.energy_embed(e_predictions.transpose(1, 2)).transpose(1, 2)
-        output = output + e_embs + p_embs
-
-        # upsampling
-        if feats_lengths is not None:
-            h_masks = make_non_pad_mask(feats_lengths).to(output.device)
-        else:
-            h_masks = None
-        d_masks = make_non_pad_mask(src_lens).to(d_predictions.device)
-        output = self.length_regulator(output, d_predictions, h_masks, d_masks)  # (B, T_feats, adim)
-
-        # forward decoder
-        if feats_lengths is not None:
-            h_masks = self._source_mask(feats_lengths)
-        else:
-            h_masks = None
-        zs, _ = self.decoder(output, h_masks)  # (B, T_feats, adim)
+        zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
 
         # forward generator
         wav = self.generator(zs.transpose(1,2))
-        return wav, d_predictions
+        return wav, d_rounded
