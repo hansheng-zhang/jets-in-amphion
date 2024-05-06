@@ -318,15 +318,15 @@ class MelSpectrogramLoss(torch.nn.Module):
         input_power = input_stft[..., 0] ** 2 + input_stft[..., 1] ** 2
         input_amp = torch.sqrt(torch.clamp(input_power, min=1.0e-10))
         input_feats = self.logmel(input_amp, feats_lens)
-        return input_feats
+        return input_feats, feats_lens
     
     def forward(
         self,
         y_hat: torch.Tensor,
         y: torch.Tensor,
     ) -> torch.Tensor:
-        mel_hat = self.wav_to_mel(y_hat.squeeze(1))
-        mel = self.wav_to_mel(y.squeeze(1))
+        mel_hat, _ = self.wav_to_mel(y_hat.squeeze(1))
+        mel, _ = self.wav_to_mel(y.squeeze(1))
         mel_loss = F.l1_loss(mel_hat, mel)
 
         return mel_loss

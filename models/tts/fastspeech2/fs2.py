@@ -16,6 +16,7 @@ from models.tts.fastspeech2.alignments import AlignmentModule, viterbi_decode, a
 from models.tts.fastspeech2.length_regulator import GaussianUpsampling
 from models.vocoders.gan.generator.hifigan import HiFiGAN
 from models.tts.fastspeech2.jets_loss import MelSpectrogramLoss
+from modules.wenet_extractor.transformer.cmvn import GlobalCMVN
 import os
 import json
 
@@ -462,14 +463,24 @@ class FastSpeech2(nn.Module):
         """
         x_masks = make_non_pad_mask(ilens).to(next(self.parameters()).device)
         return x_masks
-    
+
+    def log_feats(self, feats, feats_lengths):
+        feats, feats_lengths = self.mel_loss.wav_to_mel(feats, feats_lengths)
+        mean = feats.mean(dim=(0,1))
+        istd = 1 / (feats.std(dim=(0,1)) + 1e-20)
+        global_cmvn = GlobalCMVN(mean, istd)
+        feats = global_cmvn(feats)
+        mask = make_pad_mask(feats_lengths, feats, 1)
+        feats = feats.masked_fill_(mask, 0.0)
+        return feats, feats_lengths
+
     def forward(self, data, p_control=1.0, e_control=1.0, d_control=1.0):
         speakers = data["spk_id"]
         texts = data["texts"]
         src_lens = data["text_len"]
         max_src_len = max(src_lens)
         mel_lens = data["target_len"] if "target_len" in data else None
-        feats = self.mel_loss.wav_to_mel(data["audio"], data["audio_len"])
+        feats, feats_lengths = self.log_feats(data["audio"], data["audio_len"])
         feats_lengths = mel_lens
         max_mel_len = max(mel_lens) if "target_len" in data else None
         p_targets = data["pitch"] if "pitch" in data else None
