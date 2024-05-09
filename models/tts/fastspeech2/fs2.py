@@ -234,9 +234,9 @@ class VarianceAdaptor(nn.Module):
         energy_embedding=None
         ):
         
-        p_outs = self.pitch_predictor(x, src_mask.unsqueeze(-1))
-        e_outs = self.energy_predictor(x, src_mask.unsqueeze(-1))
-        d_outs = self.duration_predictor.inference(x, src_mask)
+        p_outs = self.pitch_predictor(x, src_mask)
+        e_outs = self.energy_predictor(x, src_mask)
+        d_outs = self.duration_predictor(x, src_mask)
 
         return p_outs, e_outs, d_outs
 
@@ -387,6 +387,7 @@ class FastSpeech2(nn.Module):
         self.encoder = Encoder(cfg.model)
         self.variance_adaptor = VarianceAdaptor(cfg)
         self.decoder = Decoder(cfg.model)
+        self.length_regulator_infer = LengthRegulator()
         self.mel_linear = nn.Linear(
             cfg.model.transformer.decoder_hidden,
             cfg.preprocess.n_mel,
@@ -565,7 +566,7 @@ class FastSpeech2(nn.Module):
         )
 
         x_masks = self._source_mask(src_lens)
-        hs, _ = self.encoder(texts, x_masks)
+        hs = self.encoder(texts, src_masks)
 
         (
             p_outs,
@@ -573,11 +574,11 @@ class FastSpeech2(nn.Module):
             d_outs,
         ) = self.variance_adaptor.inference(
             hs,
-            x_masks,
+            src_masks,
         )
 
-        p_embs = self.pitch_embed(p_outs.transpose(1, 2)).transpose(1, 2)
-        e_embs = self.energy_embed(e_outs.transpose(1, 2)).transpose(1, 2)
+        p_embs = self.pitch_embed(p_outs.unsqueeze(-1).transpose(1, 2)).transpose(1, 2)
+        e_embs = self.energy_embed(e_outs.unsqueeze(-1).transpose(1, 2)).transpose(1, 2)
         hs = hs + e_embs + p_embs
 
         # Duration predictor inference mode: log_d_pred to d_pred
@@ -593,17 +594,18 @@ class FastSpeech2(nn.Module):
             h_masks = make_non_pad_mask(feats_lengths).to(hs.device)
         else:
             h_masks = None
-        d_masks = make_non_pad_mask(text_lengths).to(d_outs.device)
-        hs = self.length_regulator(hs, d_outs, h_masks, d_masks)  # (B, T_feats, adim)
-
+        d_masks = make_non_pad_mask(src_lens).to(d_outs.device)
+        # hs = self.length_regulator(hs, d_outs, h_masks, d_masks)  # (B, T_feats, adim)
+        hs, mel_len = self.length_regulator_infer(hs, d_predictions, max_mel_len)
+        mel_mask = get_mask_from_lengths(mel_len)
         # forward decoder
         if feats_lengths is not None:
             h_masks = self._source_mask(feats_lengths)
         else:
             h_masks = None
-        zs, _ = self.decoder(hs, h_masks)  # (B, T_feats, adim)
+        zs, _ = self.decoder(hs, mel_mask)  # (B, T_feats, adim)
 
         # forward generator
         wav = self.generator(zs.transpose(1, 2))
 
-        return wav.squeeze(1), d_outs
+        return wav, d_predictions
