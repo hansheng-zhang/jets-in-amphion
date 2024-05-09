@@ -404,6 +404,7 @@ class FastSpeech2(nn.Module):
         output_dim = cfg.preprocess.n_mel
         attention_dim = 256
         self.alignment_module = AlignmentModule(attention_dim, output_dim)
+        self.after_norm = nn.LayerNorm(attention_dim)
 
         # NOTE(kan-bayashi): We use continuous pitch + FastPitch style avg
         pitch_embed_kernel_size: int = 9
@@ -502,7 +503,12 @@ class FastSpeech2(nn.Module):
 
         # forward alignment module and obtain duration, averaged pitch, energy
         h_masks = make_pad_mask(src_lens).to(output.device)
-        log_p_attn = self.alignment_module(output, feats, h_masks)
+        # h_masks = torch.load("/mnt/workspace/zhanghansheng/Amphion/models/tts/fastspeech2/jets_h_masks.pt", map_location=torch.device('cuda'))
+        # feats = torch.load("/mnt/workspace/zhanghansheng/Amphion/models/tts/fastspeech2/jets_feats.pt", map_location=torch.device('cuda'))
+        # output = torch.load("/mnt/workspace/zhanghansheng/Amphion/models/tts/fastspeech2/jets_hs.pt", map_location=torch.device('cuda'))
+        output_align = self.after_norm(output)
+        log_p_attn = self.alignment_module(output_align, feats, h_masks)
+        save_tensor_as_png(log_p_attn[0], "log_p_attn")
         ds, bin_loss = viterbi_decode(log_p_attn, src_lens, feats_lengths)
         ps = average_by_duration(ds, p_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
         es = average_by_duration(ds, e_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
