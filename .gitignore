@@ -45,7 +45,7 @@ ckpts
 *.npz
 *.tar.gz
 *.ckpt
-*.wav
+# *.wav
 *.flac
 pretrained/wenet/*conformer_exp
 pretrained/bigvgan/args.json
