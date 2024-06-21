@@ -1,11 +1,11 @@
 {
-  "base_config": "config/fs2.json",
+  "base_config": "config/jets.json",
   "model_type": "Jets",
   "dataset": [
     "LJSpeech"
   ],
   "dataset_path": {
-    "LJSpeech": "../LJSpeech-mini"
+    "LJSpeech": "../LJSpeech-1.1"
   },
   "log_dir": "ckpts/tts",
   "preprocess": {
