@@ -1,6 +1,6 @@
 {
   "base_config": "config/fs2.json",
-  "model_type": "FastSpeech2",
+  "model_type": "Jets",
   "dataset": [
     "LJSpeech"
   ],

@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-#  This code is modified from https://github.com/ming024/FastSpeech2/blob/master/model/fastspeech2.py
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -12,9 +12,13 @@ import torch.nn.functional as F
 from modules.transformer.Models import Encoder, Decoder
 from modules.transformer.Layers import PostNet
 from collections import OrderedDict
-
+from models.tts.jets.alignments import AlignmentModule, viterbi_decode, average_by_duration, make_pad_mask, make_non_pad_mask, get_random_segments
+from models.tts.jets.length_regulator import GaussianUpsampling
+from models.vocoders.gan.generator.hifigan import HiFiGAN
 import os
 import json
+
+from utils.util import load_config
 
 
 def get_mask_from_lengths(lengths, max_len=None):
@@ -27,7 +31,6 @@ def get_mask_from_lengths(lengths, max_len=None):
     mask = ids >= lengths.unsqueeze(1).expand(-1, max_len)
 
     return mask
-
 
 def pad(input_ele, mel_max_length=None):
     if mel_max_length:
@@ -184,18 +187,16 @@ class VarianceAdaptor(nn.Module):
         p_control=1.0,
         e_control=1.0,
         d_control=1.0,
+        pitch_embedding=None,
+        energy_embedding=None
     ):
         log_duration_prediction = self.duration_predictor(x, src_mask)
-        if self.pitch_feature_level == "phoneme_level":
-            pitch_prediction, pitch_embedding = self.get_pitch_embedding(
-                x, pitch_target, src_mask, p_control
-            )
-            x = x + pitch_embedding
-        if self.energy_feature_level == "phoneme_level":
-            energy_prediction, energy_embedding = self.get_energy_embedding(
-                x, energy_target, src_mask, e_control
-            )
-            x = x + energy_embedding
+
+        x = x + pitch_embedding
+        x = x + energy_embedding
+
+        pitch_prediction = self.pitch_predictor(x, src_mask)
+        energy_prediction = self.energy_predictor(x, src_mask)
 
         if duration_target is not None:
             x, mel_len = self.length_regulator(x, duration_target, max_len)
@@ -208,17 +209,6 @@ class VarianceAdaptor(nn.Module):
             x, mel_len = self.length_regulator(x, duration_rounded, max_len)
             mel_mask = get_mask_from_lengths(mel_len)
 
-        if self.pitch_feature_level == "frame_level":
-            pitch_prediction, pitch_embedding = self.get_pitch_embedding(
-                x, pitch_target, mel_mask, p_control
-            )
-            x = x + pitch_embedding
-        if self.energy_feature_level == "frame_level":
-            energy_prediction, energy_embedding = self.get_energy_embedding(
-                x, energy_target, mel_mask, p_control
-            )
-            x = x + energy_embedding
-
         return (
             x,
             pitch_prediction,
@@ -228,6 +218,27 @@ class VarianceAdaptor(nn.Module):
             mel_len,
             mel_mask,
         )
+    def inference(
+        self,
+        x,
+        src_mask,
+        mel_mask=None,
+        max_len=None,
+        pitch_target=None,
+        energy_target=None,
+        duration_target=None,
+        p_control=1.0,
+        e_control=1.0,
+        d_control=1.0,
+        pitch_embedding=None,
+        energy_embedding=None
+        ):
+        
+        p_outs = self.pitch_predictor(x, src_mask)
+        e_outs = self.energy_predictor(x, src_mask)
+        d_outs = self.duration_predictor(x, src_mask)
+
+        return p_outs, e_outs, d_outs
 
 
 class LengthRegulator(nn.Module):
@@ -369,13 +380,14 @@ class Conv(nn.Module):
         return x
 
 
-class FastSpeech2(nn.Module):
+class Jets(nn.Module):
     def __init__(self, cfg) -> None:
-        super(FastSpeech2, self).__init__()
+        super(Jets, self).__init__()
         self.cfg = cfg
         self.encoder = Encoder(cfg.model)
         self.variance_adaptor = VarianceAdaptor(cfg)
         self.decoder = Decoder(cfg.model)
+        self.length_regulator_infer = LengthRegulator()
         self.mel_linear = nn.Linear(
             cfg.model.transformer.decoder_hidden,
             cfg.preprocess.n_mel,
@@ -396,16 +408,80 @@ class FastSpeech2(nn.Module):
                 cfg.model.transformer.encoder_hidden,
             )
 
+        output_dim = cfg.preprocess.n_mel
+        attention_dim = 256
+        self.alignment_module = AlignmentModule(attention_dim, output_dim)
+
+        # NOTE(kan-bayashi): We use continuous pitch + FastPitch style avg
+        pitch_embed_kernel_size: int = 9
+        pitch_embed_dropout: float = 0.5
+        self.pitch_embed = torch.nn.Sequential(
+            torch.nn.Conv1d(
+                in_channels=1,
+                out_channels=attention_dim,
+                kernel_size=pitch_embed_kernel_size,
+                padding=(pitch_embed_kernel_size - 1) // 2,
+            ),
+            torch.nn.Dropout(pitch_embed_dropout),
+        )
+        
+        # NOTE(kan-bayashi): We use continuous enegy + FastPitch style avg
+        energy_embed_kernel_size: int = 9
+        energy_embed_dropout: float = 0.5
+        self.energy_embed = torch.nn.Sequential(
+            torch.nn.Conv1d(
+                in_channels=1,
+                out_channels=attention_dim,
+                kernel_size=energy_embed_kernel_size,
+                padding=(energy_embed_kernel_size - 1) // 2,
+            ),
+            torch.nn.Dropout(energy_embed_dropout),
+        )
+
+        # define length regulator
+        self.length_regulator = GaussianUpsampling()
+
+        self.segment_size: int = 64
+
+        # Define HiFiGAN generator
+        hifi_cfg = load_config("egs/vocoder/gan/hifigan/exp_config.json")
+        # hifi_cfg.model.hifigan.resblock_kernel_sizes = [3, 7, 11]
+        hifi_cfg.preprocess.n_mel = attention_dim
+        self.generator = HiFiGAN(hifi_cfg)
+
+    def _source_mask(self, ilens: torch.Tensor) -> torch.Tensor:
+        """Make masks for self-attention.
+
+        Args:
+            ilens (LongTensor): Batch of lengths (B,).
+
+        Returns:
+            Tensor: Mask tensor for self-attention.
+                dtype=torch.uint8 in PyTorch 1.2-
+                dtype=torch.bool in PyTorch 1.2+ (including 1.2)
+
+        Examples:
+            >>> ilens = [5, 3]
+            >>> self._source_mask(ilens)
+            tensor([[[1, 1, 1, 1, 1],
+                     [1, 1, 1, 0, 0]]], dtype=torch.uint8)
+
+        """
+        x_masks = make_non_pad_mask(ilens).to(next(self.parameters()).device)
+        return x_masks.unsqueeze(-2)
+    
     def forward(self, data, p_control=1.0, e_control=1.0, d_control=1.0):
         speakers = data["spk_id"]
         texts = data["texts"]
         src_lens = data["text_len"]
         max_src_len = max(src_lens)
+        feats = data["mel"]
         mel_lens = data["target_len"] if "target_len" in data else None
+        feats_lengths = mel_lens
         max_mel_len = max(mel_lens) if "target_len" in data else None
         p_targets = data["pitch"] if "pitch" in data else None
         e_targets = data["energy"] if "energy" in data else None
-        d_targets = data["durations"] if "durations" in data else None
+        # d_targets = data["durations"] if "durations" in data else None
         src_masks = get_mask_from_lengths(src_lens, max_src_len)
         mel_masks = (
             get_mask_from_lengths(mel_lens, max_mel_len)
@@ -420,6 +496,18 @@ class FastSpeech2(nn.Module):
                 -1, max_src_len, -1
             )
 
+        # forward alignment module and obtain duration, averaged pitch, energy
+        # h_masks = make_pad_mask(text_lengths).to(hs.device)
+        h_masks = make_pad_mask(src_lens).to(output.device)
+        # log_p_attn = self.alignment_module(hs, feats, h_masks)
+        log_p_attn = self.alignment_module(output, feats, src_lens, feats_lengths, h_masks)
+        ds, bin_loss = viterbi_decode(log_p_attn, src_lens, feats_lengths)
+        # ps = average_by_duration(ds, pitch.squeeze(-1), text_lengths, feats_lengths).unsqueeze(-1)
+        ps = average_by_duration(ds, p_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
+        # es = average_by_duration(ds, energy.squeeze(-1), text_lengths, feats_lengths).unsqueeze(-1)
+        es = average_by_duration(ds, e_targets.squeeze(-1), src_lens, feats_lengths).unsqueeze(-1)
+        p_embs = self.pitch_embed(ps.transpose(1, 2)).transpose(1, 2)
+        e_embs = self.energy_embed(es.transpose(1, 2)).transpose(1, 2)
         (
             output,
             p_predictions,
@@ -435,114 +523,89 @@ class FastSpeech2(nn.Module):
             max_mel_len,
             p_targets,
             e_targets,
-            d_targets,
+            ds,
             p_control,
             e_control,
             d_control,
+            ps,
+            es
         )
 
-        output, mel_masks = self.decoder(output, mel_masks)
-        output = self.mel_linear(output)
+        # forward decoder
+        # h_masks = self._source_mask(feats_lengths)
+        zs, _ = self.decoder(output, mel_masks)  # (B, T_feats, adim)
 
-        postnet_output = self.postnet(output) + output
+        # get random segments
+        z_segments, z_start_idxs = get_random_segments(
+            zs.transpose(1,2),
+            feats_lengths,
+            self.segment_size,
+        )
 
-        return {
-            "output": output,
-            "postnet_output": postnet_output,
-            "p_predictions": p_predictions,
-            "e_predictions": e_predictions,
-            "log_d_predictions": log_d_predictions,
-            "d_rounded": d_rounded,
-            "src_masks": src_masks,
-            "mel_masks": mel_masks,
-            "src_lens": src_lens,
-            "mel_lens": mel_lens,
-        }
+        # forward generator
+        wav = self.generator(z_segments)
 
+        return wav, bin_loss, log_p_attn, z_start_idxs, log_d_predictions, ds, p_predictions, ps, e_predictions, es, src_lens, feats_lengths
 
-class FastSpeech2Loss(nn.Module):
-    """FastSpeech2 Loss"""
+    def inference(self, data, p_control=1.0, e_control=1.0, d_control=1.0):
+        speakers = data["spk_id"]
+        texts = data["texts"]
+        src_lens = data["text_len"]
+        max_src_len = max(src_lens)
+        mel_lens = data["target_len"] if "target_len" in data else None
+        feats_lengths = mel_lens
+        max_mel_len = max(mel_lens) if "target_len" in data else None
+        p_targets = data["pitch"] if "pitch" in data else None
+        e_targets = data["energy"] if "energy" in data else None
+        d_targets = data["durations"] if "durations" in data else None
+        src_masks = get_mask_from_lengths(src_lens, max_src_len)
+        mel_masks = (
+            get_mask_from_lengths(mel_lens, max_mel_len)
+            if mel_lens is not None
+            else None
+        )
 
-    def __init__(self, cfg):
-        super(FastSpeech2Loss, self).__init__()
-        if cfg.preprocess.use_frame_pitch:
-            self.pitch_feature_level = "frame_level"
+        x_masks = self._source_mask(src_lens)
+        hs = self.encoder(texts, src_masks)
+
+        (
+            p_outs,
+            e_outs,
+            d_outs,
+        ) = self.variance_adaptor.inference(
+            hs,
+            src_masks,
+        )
+
+        p_embs = self.pitch_embed(p_outs.unsqueeze(-1).transpose(1, 2)).transpose(1, 2)
+        e_embs = self.energy_embed(e_outs.unsqueeze(-1).transpose(1, 2)).transpose(1, 2)
+        hs = hs + e_embs + p_embs
+
+        # Duration predictor inference mode: log_d_pred to d_pred
+        offset = 1.0
+        d_predictions = torch.clamp(
+                torch.round(d_outs.exp() - offset), min=0
+            ).long()  # avoid negative value
+
+        # forward decoder
+        # h_masks = self._source_mask(feats_lengths)
+        # upsampling
+        if feats_lengths is not None:
+            h_masks = make_non_pad_mask(feats_lengths).to(hs.device)
         else:
-            self.pitch_feature_level = "phoneme_level"
-
-        if cfg.preprocess.use_frame_energy:
-            self.energy_feature_level = "frame_level"
+            h_masks = None
+        d_masks = make_non_pad_mask(src_lens).to(d_outs.device)
+        # hs = self.length_regulator(hs, d_outs, h_masks, d_masks)  # (B, T_feats, adim)
+        hs, mel_len = self.length_regulator_infer(hs, d_predictions, max_mel_len)
+        mel_mask = get_mask_from_lengths(mel_len)
+        # forward decoder
+        if feats_lengths is not None:
+            h_masks = self._source_mask(feats_lengths)
         else:
-            self.energy_feature_level = "phoneme_level"
+            h_masks = None
+        zs, _ = self.decoder(hs, mel_mask)  # (B, T_feats, adim)
 
-        self.mse_loss = nn.MSELoss()
-        self.mae_loss = nn.L1Loss()
+        # forward generator
+        wav = self.generator(zs.transpose(1, 2))
 
-    def forward(self, data, predictions):
-        mel_targets = data["mel"]
-        pitch_targets = data["pitch"].float()
-        energy_targets = data["energy"].float()
-        duration_targets = data["durations"]
-
-        mel_predictions = predictions["output"]
-        postnet_mel_predictions = predictions["postnet_output"]
-        pitch_predictions = predictions["p_predictions"]
-        energy_predictions = predictions["e_predictions"]
-        log_duration_predictions = predictions["log_d_predictions"]
-        src_masks = predictions["src_masks"]
-        mel_masks = predictions["mel_masks"]
-
-        src_masks = ~src_masks
-        mel_masks = ~mel_masks
-
-        log_duration_targets = torch.log(duration_targets.float() + 1)
-        mel_targets = mel_targets[:, : mel_masks.shape[1], :]
-        mel_masks = mel_masks[:, : mel_masks.shape[1]]
-
-        log_duration_targets.requires_grad = False
-        pitch_targets.requires_grad = False
-        energy_targets.requires_grad = False
-        mel_targets.requires_grad = False
-
-        if self.pitch_feature_level == "phoneme_level":
-            pitch_predictions = pitch_predictions.masked_select(src_masks)
-            pitch_targets = pitch_targets.masked_select(src_masks)
-        elif self.pitch_feature_level == "frame_level":
-            pitch_predictions = pitch_predictions.masked_select(mel_masks)
-            pitch_targets = pitch_targets.masked_select(mel_masks)
-
-        if self.energy_feature_level == "phoneme_level":
-            energy_predictions = energy_predictions.masked_select(src_masks)
-            energy_targets = energy_targets.masked_select(src_masks)
-        if self.energy_feature_level == "frame_level":
-            energy_predictions = energy_predictions.masked_select(mel_masks)
-            energy_targets = energy_targets.masked_select(mel_masks)
-
-        log_duration_predictions = log_duration_predictions.masked_select(src_masks)
-        log_duration_targets = log_duration_targets.masked_select(src_masks)
-
-        mel_predictions = mel_predictions.masked_select(mel_masks.unsqueeze(-1))
-        postnet_mel_predictions = postnet_mel_predictions.masked_select(
-            mel_masks.unsqueeze(-1)
-        )
-        mel_targets = mel_targets.masked_select(mel_masks.unsqueeze(-1))
-
-        mel_loss = self.mae_loss(mel_predictions, mel_targets)
-        postnet_mel_loss = self.mae_loss(postnet_mel_predictions, mel_targets)
-
-        pitch_loss = self.mse_loss(pitch_predictions, pitch_targets)
-        energy_loss = self.mse_loss(energy_predictions, energy_targets)
-        duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
-
-        total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss
-        )
-
-        return {
-            "loss": total_loss,
-            "mel_loss": mel_loss,
-            "postnet_mel_loss": postnet_mel_loss,
-            "pitch_loss": pitch_loss,
-            "energy_loss": energy_loss,
-            "duration_loss": duration_loss,
-        }
+        return wav, d_predictions

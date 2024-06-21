@@ -9,10 +9,10 @@ from tqdm import tqdm
 from collections import OrderedDict
 
 from models.tts.base.tts_inferece import TTSInference
-from models.tts.fastspeech2.fs2_dataset import FS2TestDataset, FS2TestCollator
+from models.tts.jets.jets_dataset import FS2TestDataset, FS2TestCollator
 from utils.util import load_config
 from utils.io import save_audio
-from models.tts.fastspeech2.fs2 import FastSpeech2
+from models.tts.jets.jets import Jets
 from models.vocoders.vocoder_inference import synthesis
 from pathlib import Path
 from processors.phone_extractor import phoneExtractor
@@ -22,7 +22,7 @@ import json
 import time
 
 
-class FastSpeech2Inference(TTSInference):
+class JetsInference(TTSInference):
     def __init__(self, args, cfg):
         TTSInference.__init__(self, args, cfg)
         self.args = args
@@ -30,7 +30,7 @@ class FastSpeech2Inference(TTSInference):
         self.infer_type = args.mode
 
     def _build_model(self):
-        self.model = FastSpeech2(self.cfg)
+        self.model = Jets(self.cfg)
         return self.model
 
     def _build_test_dataset(self):

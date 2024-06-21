@@ -9,9 +9,9 @@ import os
 from utils.io import save_audio
 from tqdm import tqdm
 from models.tts.base import TTSTrainer
-from models.tts.fastspeech2.fs2 import FastSpeech2
-from models.tts.fastspeech2.jets_loss import GeneratorLoss, DiscriminatorLoss
-from models.tts.fastspeech2.fs2_dataset import FS2Dataset, FS2Collator
+from models.tts.jets.jets import Jets
+from models.tts.jets.jets_loss import GeneratorLoss, DiscriminatorLoss
+from models.tts.jets.jets_dataset import FS2Dataset, FS2Collator
 from optimizer.optimizers import NoamLR
 from torch.optim.lr_scheduler import ExponentialLR
 from models.vocoders.gan.discriminator.mpd import MultiScaleMultiPeriodDiscriminator
@@ -38,7 +38,7 @@ def get_segments(
         segments[i] = x[i, :, start_idx : start_idx + segment_size]
     return segments
 
-class FastSpeech2Trainer(TTSTrainer):
+class JetsTrainer(TTSTrainer):
     def __init__(self, args, cfg):
         TTSTrainer.__init__(self, args, cfg)
         self.cfg = cfg
@@ -145,7 +145,7 @@ class FastSpeech2Trainer(TTSTrainer):
         return scheduler
 
     def _build_model(self):
-        net_g = FastSpeech2(self.cfg)
+        net_g = Jets(self.cfg)
         net_d = MultiScaleMultiPeriodDiscriminator()
         self.model = {"generator": net_g, "discriminator": net_d}
         return self.model
