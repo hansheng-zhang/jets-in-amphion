@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from models.tts.base import TTSTrainer
-from models.tts.jets.jets import FastSpeech2, FastSpeech2Loss
-from models.tts.jets.jets_dataset import FS2Dataset, FS2Collator
+from models.tts.fastspeech2.fs2 import FastSpeech2, FastSpeech2Loss
+from models.tts.fastspeech2.fs2_dataset import FS2Dataset, FS2Collator
 from optimizer.optimizers import NoamLR
 
 
