@@ -1,0 +1,27 @@
+listenpython -m debugpy --listen localhost:10010 --wait-for-client \
+sh egs/vocoder/gan/hifigan/run.sh --stage 1
+sh egs/tts/FastSpeech2/run.sh --stage 2 --name infer_test_2 --gpu "5"
+sh egs/tts/FastSpeech2/run.sh --stage 2 --name inverse_mask_test --gpu "6"
+sh egs/tts/FastSpeech2/run.sh --stage 1
+sh egs/tts/VITS/run.sh --stage 2 --name zhsvits1
+
+cp wavs/LJ001-0{001..186}.wav ../LJSpeech-500/wavs
+cp wavs/LJ002-0{001..315}.wav ../LJSpeech-500/wavs
+head -n 500 metadata.csv > new_file.csv
+for file in $(ls -1 | head -1000); do cp "$file" ../../LJSpeech-1000/wavs/; done
+cp -r LJSpeech-500/ ./jets/espnet/egs2/ljspeech/tts1/downloads/
+
+sh egs/tts/VITS/run.sh --stage 3 --gpu "5" \
+    --infer_expt_dir /mnt/workspace/zhanghansheng/Amphion/ckpts/tts/vits_ljspeech \
+    --infer_output_dir /mnt/workspace/zhanghansheng/Amphion/ckpts/tts/vits_ljspeech/result \
+    --infer_mode "batch" \
+    --infer_dataset "LJSpeech" \
+    --infer_testing_set "test"
+
+sh egs/tts/FastSpeech2/run.sh --stage 3 --gpu "7" \
+    --infer_expt_dir ckpts/tts/infer_test_2 \
+    --infer_output_dir ckpts/tts/infer_test_2/result \
+    --infer_mode "batch" \
+    --infer_dataset "LJSpeech" \
+    --infer_testing_set "test" \
+    --vocoder_dir ckpts/vocoder/hifigan_ljspeech/checkpoints
